@@ -1,6 +1,6 @@
 # 更新日志
 
-本文件记录「LivingMemory 桌宠直连桥接 (astrbot_plugin_livingmemory_bridge)」插件的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+本文件记录「LivingMemory 桌宠直连桥接 (astrbot_plugin_coopanion_livingmemory)」插件的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
 ## [0.1.0-dev.7] - 2026-11-05
 

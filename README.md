@@ -1,10 +1,12 @@
-# astrbot_plugin_livingmemory_bridge
+# astrbot_plugin_coopanion_livingmemory
 
 把 AstrBot 的 LivingMemory 长期记忆接到 Coopanion 桌宠上。
 
 QQ 上聊过的事桌宠记得，桌宠这儿说过的约定 QQ 那边也知道——因为两边读写的是同一份记忆库与知识图谱。
 
-> 桌宠侧还需要装对应扩展 `cortico-world-livingmemory`，两个包按同一套协议对接，**必须成对安装**。
+> **适用范围**：本插件**只能运行在 AstrBot** 上——它直接调用 AstrBot 的插件 API 与 `astrbot_plugin_livingmemory` 的内部引擎，不跨平台。桥暴露的 HTTP 接口（`/api/memory/*`）本身是通用 JSON 协议，理论上任何本机程序都能对接；但配套的桌宠端扩展目前只有 Coopanion 版本。
+
+> 桌宠侧还需要装对应扩展 `cortico-world-astrbot-livingmemory`，两个包按同一套协议对接，**必须成对安装**。
 
 ---
 
@@ -17,7 +19,7 @@ Coopanion（桌宠）
 cortico-world-livingmemory（桌宠侧，TypeScript）
   │  本地 HTTP，默认 127.0.0.1:6198
   ▼
-astrbot_plugin_livingmemory_bridge（本插件，Python）   ← 只做转接
+astrbot_plugin_coopanion_livingmemory（本插件，Python）   ← 只做转接
   │  直接调用 LivingMemory 的引擎接口
   ▼
 astrbot_plugin_livingmemory（记忆库 + 知识图谱 + 会话蒸馏）
