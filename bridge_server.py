@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+import hmac
 import time
 from typing import Any
 
@@ -82,7 +82,8 @@ class LivingMemoryBridgeServer:
         """配了 token 时校验 Authorization: Bearer <token>。"""
         if self.auth_token and request.path.startswith("/api/"):
             got = request.headers.get("Authorization", "")
-            if got != f"Bearer {self.auth_token}":
+            expected = f"Bearer {self.auth_token}"
+            if not hmac.compare_digest(got, expected):
                 return web.json_response(
                     {"ok": False, "error": "unauthorized: token 不匹配"}, status=401
                 )
@@ -545,8 +546,8 @@ class LivingMemoryBridgeServer:
         return web.json_response(
             {
                 "ok": True,
-                "plugin": "astrbot_plugin_livingmemory_bridge",
-                "version": "0.1.0",
+                "plugin": "astrbot_plugin_coopanion_livingmemory",
+                "version": "0.1.1",
                 "livingmemory_connected": connected,
                 "reflection_available": self._get_reflection() is not None,
                 "auto_reflection": self.enable_auto_reflection,

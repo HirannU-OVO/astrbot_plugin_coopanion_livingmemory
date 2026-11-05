@@ -2,6 +2,17 @@
 
 本文件记录「LivingMemory 桌宠直连桥接 (astrbot_plugin_coopanion_livingmemory)」插件的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.1] - 2026-11-05
+
+### 修复
+
+- **安全检查规范**：删除 `bridge_server.py` 中多余未用的 `import logging`，严格遵循 AstrBot 插件必须且只能从 `astrbot.api import logger` 的日志规范。
+
+### 优化
+
+- **恒定时间鉴权比较**：鉴权中间件改用 `hmac.compare_digest` 进行恒定时间比较，消除字符串直接比较带来的时序攻击（Timing Attack）隐患。
+- 修正 `/api/health` 探针返回中的插件标识字段为 `astrbot_plugin_coopanion_livingmemory`。
+
 ## [0.1.0] - 2026-11-05
 
 > 首个正式版：把 AstrBot 的 LivingMemory 长期记忆与知识图谱，通过本地 HTTP 桥接给 Coopanion 桌宠。

@@ -2,7 +2,7 @@ name: astrbot_plugin_coopanion_livingmemory
 display_name: LivingMemory 桌宠桥接（AstrBot 对接 Coopanion）
 desc: 为桌宠 (Coopanion) 提供 LivingMemory 的本地 HTTP 直连桥接服务，支持双向检索、记忆注入与对话流自动同化。配套桌宠扩展 cortico-world-astrbot-livingmemory。
 help: 插件自动在后台监听 127.0.0.1:6198，供 cortico-world-astrbot-livingmemory 扩展进行高吞吐直连交互。
-version: 0.1.0
+version: 0.1.1
 author: HirannU
 repo: https://github.com/HirannU-OVO/astrbot_plugin_coopanion_livingmemory
 support_platforms:
