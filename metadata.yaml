@@ -1,0 +1,8 @@
+name: astrbot_plugin_livingmemory_bridge
+display_name: LivingMemory 桌宠直连桥接
+desc: 为桌宠 (Coopanion) 提供 LivingMemory 的本地 HTTP 直连桥接服务，支持双向检索、记忆注入与对话流自动同化
+help: 插件自动在后台监听 127.0.0.1:6198，供 cortico-world-livingmemory 扩展进行高吞吐直连交互。
+version: v0.1.0-dev.7
+author: HirannU
+support_platforms:
+  - aiocqhttp

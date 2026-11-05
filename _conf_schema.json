@@ -1,0 +1,67 @@
+{
+  "bot_qq": {
+    "type": "string",
+    "description": "桌宠的 QQ 号。留空自动从历史消息里识别。 改完需重启 AstrBot。",
+    "default": ""
+  },
+  "bot_name": {
+    "type": "string",
+    "description": "桌宠的称呼（别人怎么叫它）。留空自动识别。 改完需重启 AstrBot。",
+    "default": ""
+  },
+  "bot_aliases_text": {
+    "type": "string",
+    "description": "桌宠的其他叫法，逗号分隔（可选）。不同叫法不登记会被图谱当成两个人。 改完需重启 AstrBot。",
+    "default": ""
+  },
+  "user_name": {
+    "type": "string",
+    "description": "你的称呼（桌宠怎么称呼你）。留空自动识别。 改完需重启 AstrBot。",
+    "default": ""
+  },
+  "user_names_text": {
+    "type": "string",
+    "description": "其他用户的称呼映射，格式：QQ号=名字,QQ号=名字（可选，留空自动识别）。 改完需重启 AstrBot。",
+    "default": ""
+  },
+  "user_aliases_text": {
+    "type": "string",
+    "description": "用户的其他叫法，格式：QQ号=别名1/别名2,QQ号=别名3（可选）。 改完需重启 AstrBot。",
+    "default": ""
+  },
+  "auth_token": {
+    "type": "string",
+    "description": "可选。填了之后桌宠侧「鉴权令牌」要填同一串。 改完需重启 AstrBot。",
+    "default": ""
+  },
+  "port": {
+    "type": "int",
+    "description": "监听端口。默认 6198，与桌宠侧桥地址保持一致。 改完需重启 AstrBot。",
+    "default": 6198
+  },
+  "default_session_id": {
+    "type": "string",
+    "description": "高级：会话 umo。留空自动检测；自动检测不到（空库）才需要手填。 改完需重启 AstrBot。",
+    "default": ""
+  },
+  "default_persona_id": {
+    "type": "string",
+    "description": "高级：记忆的人格标签，默认 default。 改完需重启 AstrBot。",
+    "default": "default"
+  },
+  "default_adapter_id": {
+    "type": "string",
+    "description": "高级：平台适配器 ID，可留空。 改完需重启 AstrBot。",
+    "default": ""
+  },
+  "enable_auto_graph_metadata": {
+    "type": "bool",
+    "description": "高级：入库时自动补齐图谱元数据。关闭后记忆之间不会建立关系，保持开启。 改完需重启 AstrBot。",
+    "default": true
+  },
+  "enable_auto_reflection": {
+    "type": "bool",
+    "description": "高级：桌宠对话自动触发记忆蒸馏（每 N 轮总结一次）。 改完需重启 AstrBot。",
+    "default": true
+  }
+}
