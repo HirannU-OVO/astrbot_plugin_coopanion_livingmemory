@@ -5,5 +5,12 @@ help: 插件自动在后台监听 127.0.0.1:6198，供 cortico-world-astrbot-liv
 version: 0.1.1
 author: HirannU
 repo: https://github.com/HirannU-OVO/astrbot_plugin_coopanion_livingmemory
+category: 长期记忆
+tags:
+  - 长期记忆
+  - 记忆
+  - 桌宠
+  - 桥接
+  - LivingMemory
 support_platforms:
   - aiocqhttp
