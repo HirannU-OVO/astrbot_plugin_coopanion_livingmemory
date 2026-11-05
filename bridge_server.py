@@ -546,7 +546,7 @@ class LivingMemoryBridgeServer:
             {
                 "ok": True,
                 "plugin": "astrbot_plugin_livingmemory_bridge",
-                "version": "v0.1.0-dev.7",
+                "version": "0.1.0",
                 "livingmemory_connected": connected,
                 "reflection_available": self._get_reflection() is not None,
                 "auto_reflection": self.enable_auto_reflection,

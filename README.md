@@ -60,7 +60,7 @@ git clone https://github.com/HirannU-OVO/astrbot_plugin_coopanion_livingmemory.g
 | :--- | :---: | :--- | :--- |
 | `default_session_id` | 是 | 统一消息会话标识 umo，使桌宠记忆与私聊记忆归属同一主体 | `persona名:FriendMessage:你的QQ号` |
 | `bot_identity` | 是 | 机器人账号身份定义（`id` 填机器人 QQ 号，`name` 填称呼） | `{"id":"10000","name":"大肥鱼","aliases":["小鲸鱼"]}` |
-| `user_display_names` | 否 | 参与者数字 ID 到自然名称的映射 | `{"168238479":"羽羽"}` |
+| `user_display_names` | 否 | 参与者数字 ID 到自然名称的映射 | `{"10000":"你的昵称"}` |
 
 > 提示：若 `default_session_id` 留空，将退化为全局独立会话，导致桌宠记忆与 QQ 会话记忆相互隔离。
 
