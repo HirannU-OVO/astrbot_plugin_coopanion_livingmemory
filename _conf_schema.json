@@ -1,67 +1,158 @@
 {
-  "bot_qq": {
-    "type": "string",
-    "description": "桌宠的 QQ 号。留空自动从历史消息里识别。 改完需重启 AstrBot。",
-    "default": ""
-  },
-  "bot_name": {
-    "type": "string",
-    "description": "桌宠的称呼（别人怎么叫它）。留空自动识别。 改完需重启 AstrBot。",
-    "default": ""
-  },
-  "bot_aliases_text": {
-    "type": "string",
-    "description": "桌宠的其他叫法，逗号分隔（可选）。不同叫法不登记会被图谱当成两个人。 改完需重启 AstrBot。",
-    "default": ""
-  },
-  "user_name": {
-    "type": "string",
-    "description": "你的称呼（桌宠怎么称呼你）。留空自动识别。 改完需重启 AstrBot。",
-    "default": ""
-  },
-  "user_names_text": {
-    "type": "string",
-    "description": "其他用户的称呼映射，格式：QQ号=名字,QQ号=名字（可选，留空自动识别）。 改完需重启 AstrBot。",
-    "default": ""
-  },
-  "user_aliases_text": {
-    "type": "string",
-    "description": "用户的其他叫法，格式：QQ号=别名1/别名2,QQ号=别名3（可选）。 改完需重启 AstrBot。",
-    "default": ""
+  "port": {
+    "type": "int",
+    "description": "监听端口",
+    "default": 6198,
+    "hint": "桌宠桥的监听端口，两边必须一致"
   },
   "auth_token": {
     "type": "string",
-    "description": "可选。填了之后桌宠侧「鉴权令牌」要填同一串。 改完需重启 AstrBot。",
-    "default": ""
+    "description": "校验 token",
+    "default": "",
+    "hint": "和桌宠扩展填同一串；留空不校验"
   },
-  "port": {
-    "type": "int",
-    "description": "监听端口。默认 6198，与桌宠侧桥地址保持一致。 改完需重启 AstrBot。",
-    "default": 6198
-  },
-  "default_session_id": {
+  "usage_mode": {
     "type": "string",
-    "description": "高级：会话 umo。留空自动检测；自动检测不到（空库）才需要手填。 改完需重启 AstrBot。",
-    "default": ""
+    "description": "使用场景",
+    "default": "qq",
+    "options": [
+      "qq",
+      "local"
+    ],
+    "labels": [
+      "接入 QQ",
+      "纯桌宠"
+    ],
+    "hint": "纯桌宠只有本机；接入 QQ 才有平台账号"
   },
-  "default_persona_id": {
+  "memory_share_mode": {
     "type": "string",
-    "description": "高级：记忆的人格标签，默认 default。 改完需重启 AstrBot。",
-    "default": "default"
+    "description": "记忆共享模式",
+    "default": "shared",
+    "options": [
+      "shared",
+      "pet_only"
+    ],
+    "labels": [
+      "一起记",
+      "桌宠单独记"
+    ],
+    "hint": "一起记＝两边共用；桌宠单独记＝只给桌宠用",
+    "condition": {
+      "usage_mode": "qq"
+    }
   },
-  "default_adapter_id": {
+  "bot_qq": {
     "type": "string",
-    "description": "高级：平台适配器 ID，可留空。 改完需重启 AstrBot。",
-    "default": ""
+    "description": "桌宠的 QQ 号",
+    "default": "",
+    "hint": "机器人的 QQ 号",
+    "condition": {
+      "usage_mode": "qq"
+    }
   },
-  "enable_auto_graph_metadata": {
-    "type": "bool",
-    "description": "高级：入库时自动补齐图谱元数据。关闭后记忆之间不会建立关系，保持开启。 改完需重启 AstrBot。",
-    "default": true
+  "bot_name": {
+    "type": "string",
+    "description": "桌宠的称呼",
+    "default": "",
+    "hint": "机器人的称呼",
+    "condition": {
+      "usage_mode": "qq"
+    }
+  },
+  "bot_aliases_text": {
+    "type": "list",
+    "description": "桌宠的其他叫法",
+    "default": [],
+    "hint": "一行一个，想加几个加几个",
+    "condition": {
+      "usage_mode": "qq"
+    }
+  },
+  "user_name": {
+    "type": "string",
+    "description": "你的称呼",
+    "default": "",
+    "hint": "桌宠这边怎么称呼你，纯桌宠也生效",
+    "condition": {
+      "usage_mode": "local"
+    }
+  },
+  "user_map": {
+    "type": "list",
+    "description": "谁是谁",
+    "default": [],
+    "hint": "一行一个，QQ 号=名字,别名",
+    "condition": {
+      "usage_mode": "qq"
+    }
+  },
+  "user_names_text": {
+    "type": "string",
+    "description": "用户本名映射",
+    "default": "",
+    "hint": "QQ 号对应的人名，换行或逗号分隔",
+    "invisible": true
+  },
+  "user_aliases_text": {
+    "type": "string",
+    "description": "用户别名映射",
+    "default": "",
+    "hint": "同一个人的其他叫法",
+    "invisible": true
   },
   "enable_auto_reflection": {
     "type": "bool",
-    "description": "高级：桌宠对话自动触发记忆蒸馏（每 N 轮总结一次）。 改完需重启 AstrBot。",
-    "default": true
+    "description": "自动总结桌宠对话",
+    "default": true,
+    "hint": "桌宠对话自动整理成记忆"
+  },
+  "enable_auto_graph_metadata": {
+    "type": "bool",
+    "description": "自动建立记忆关联",
+    "default": true,
+    "hint": "自动补记忆之间的关联"
+  },
+  "default_persona_id": {
+    "type": "string",
+    "description": "记忆存给哪个人格",
+    "default": "",
+    "hint": "留空自动识别 一般不用填"
+  },
+  "pet_persona_id": {
+    "type": "string",
+    "description": "桌宠单独记的人格",
+    "default": "",
+    "hint": "留空自动用上面人格加「-桌宠」",
+    "condition": {
+      "usage_mode": "qq",
+      "memory_share_mode": "pet_only"
+    }
+  },
+  "default_session_id": {
+    "type": "string",
+    "description": "记忆存到哪个会话（高级）",
+    "default": "",
+    "hint": "接多平台或换过账号才要填，一般留空",
+    "_special": "umo"
+  },
+  "default_adapter_id": {
+    "type": "string",
+    "description": "消息从哪个平台进来（高级）",
+    "default": "",
+    "hint": "高级项，多适配器互通时才要填，一般留空",
+    "condition": {
+      "usage_mode": "qq"
+    }
+  },
+  "read_scope_sessions_text": {
+    "type": "text",
+    "description": "私聊额外读取的群会话",
+    "default": "",
+    "hint": "私聊检索时额外并入的群会话，一般留空",
+    "invisible": true,
+    "condition": {
+      "usage_mode": "qq"
+    }
   }
 }
