@@ -5,16 +5,35 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import os
 import re
 import time
+import uuid
 from typing import Any
 
 from aiohttp import web
 from astrbot.api import logger
-from astrbot.api.star import Context
+from astrbot.api.star import Context, StarTools
+
+try:
+    from .contract import (
+        SCHEMA_VERSION,
+        TOOLS_SCHEMA_VERSION,
+        TOOLS_DEF,
+        validate_tool_params,
+    )
+    from .upstream_adapter import UpstreamLivingMemoryAdapter
+except ImportError:  # 兼容脚本/测试直接导入本模块
+    from contract import (
+        SCHEMA_VERSION,
+        TOOLS_SCHEMA_VERSION,
+        TOOLS_DEF,
+        validate_tool_params,
+    )
+    from upstream_adapter import UpstreamLivingMemoryAdapter
 
 # 身份键统一为 "<平台>:<会话/用户ID>"。平台名来自消息自带的适配器/平台字段，
 # 不再设白名单；没有任何平台标识时归入固定的本地命名空间。
@@ -41,7 +60,7 @@ KNOWN_PLATFORM_NAMES = frozenset(
 )
 
 
-VERSION = "0.2.0"
+VERSION = "0.2.2"
 
 
 class LivingMemoryBridgeServer:
@@ -54,6 +73,7 @@ class LivingMemoryBridgeServer:
     def __init__(self, context: Context, config: dict[str, Any]):
         self.context = context
         self.config = config
+        self.upstream = UpstreamLivingMemoryAdapter(context)
         self.host = config.get("host", "127.0.0.1")
         self.port = int(config.get("port", 6198))
         # 开源默认值不带任何真实账号：留空时先自动检测，检测不到才用占位
@@ -200,7 +220,96 @@ class LivingMemoryBridgeServer:
         self.app = web.Application(middlewares=[self._auth_middleware])
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
+
+        # 单实例身份与生命周期状态机 (D-03, D-04, D-05)
+        self.bridge_instance_id = (
+            f"bridge_{int(time.time() * 1000)}_{os.getpid()}_{uuid.uuid4().hex[:6]}"
+        )
+        self.started_at = time.time()
+        self.state = "starting"
+
         self._setup_routes()
+
+    def _bridge_data_dir(self) -> str:
+        try:
+            data_dir = str(StarTools.get_data_dir("astrbot_plugin_coopanion_livingmemory"))
+            os.makedirs(data_dir, exist_ok=True)
+            return data_dir
+        except Exception:
+            local_dir = os.path.join(os.path.dirname(__file__), "data")
+            os.makedirs(local_dir, exist_ok=True)
+            return local_dir
+
+    def _lock_file_path(self) -> str:
+        return os.path.join(self._bridge_data_dir(), "bridge-6198.lock")
+
+    async def _probe_port(self) -> tuple[str, dict[str, Any] | None]:
+        import aiohttp
+        url = f"http://{self.host}:{self.port}/api/health"
+        headers = {}
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=1.2)) as resp:
+                    if resp.status in (200, 401):
+                        data = {}
+                        try:
+                            data = await resp.json()
+                        except Exception:
+                            pass
+                        schema = data.get("schema_version")
+                        if schema == SCHEMA_VERSION or data.get("plugin") == "astrbot_plugin_coopanion_livingmemory":
+                            return "reuse", data
+                        return "conflict", data
+                    return "conflict", None
+        except Exception:
+            return "none", None
+
+    def _acquire_lock(self) -> bool:
+        lock_path = self._lock_file_path()
+        lock_data = {
+            "pid": os.getpid(),
+            "started_at": self.started_at,
+            "bridge_instance_id": self.bridge_instance_id,
+            "schema_version": SCHEMA_VERSION,
+            "plugin_version": VERSION,
+            "host": self.host,
+            "port": self.port,
+        }
+        try:
+            if os.path.exists(lock_path):
+                try:
+                    with open(lock_path, "r", encoding="utf-8") as f:
+                        old_info = json.load(f)
+                    old_pid = int(old_info.get("pid", 0))
+                    if old_pid and old_pid != os.getpid():
+                        try:
+                            import psutil
+                            if not psutil.pid_exists(old_pid):
+                                logger.info(f"[LivingMemoryBridge] 清理失效进程锁 (stale pid={old_pid})")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            with open(lock_path, "w", encoding="utf-8") as f:
+                json.dump(lock_data, f, ensure_ascii=False, indent=2)
+            return True
+        except Exception as e:
+            logger.warning(f"[LivingMemoryBridge] 写入锁文件失败: {e}")
+            return False
+
+    def _release_lock(self) -> None:
+        lock_path = self._lock_file_path()
+        try:
+            if os.path.exists(lock_path):
+                with open(lock_path, "r", encoding="utf-8") as f:
+                    info = json.load(f)
+                if info.get("bridge_instance_id") == self.bridge_instance_id:
+                    os.remove(lock_path)
+                    logger.debug("[LivingMemoryBridge] 进程锁已释放")
+        except Exception as e:
+            logger.debug(f"[LivingMemoryBridge] 释放锁文件失败: {e}")
 
     @web.middleware
     async def _auth_middleware(self, request: web.Request, handler):
@@ -216,63 +325,22 @@ class LivingMemoryBridgeServer:
 
     def _setup_routes(self):
         self.app.router.add_get("/api/health", self.handle_health)
+        self.app.router.add_get("/api/tools/manifest", self.handle_manifest)
         self.app.router.add_post("/api/memory/search", self.handle_search)
         self.app.router.add_post("/api/memory/add", self.handle_add)
+        self.app.router.add_post("/api/memory/memorize", self.handle_memorize)
+        self.app.router.add_post("/api/memory/recall", self.handle_recall)
+        self.app.router.add_post("/api/memory/evidence", self.handle_evidence)
+        self.app.router.add_post("/api/memory/forget", self.handle_forget)
         self.app.router.add_post("/api/memory/batch_add", self.handle_batch_add)
         self.app.router.add_post("/api/memory/chat", self.handle_chat)
         self.app.router.add_post("/api/memory/reflect", self.handle_reflect)
-
-    def _get_livingmemory_plugin(self) -> Any | None:
-        """获取 LivingMemory 插件实例（多路径探测，AstrBot 升级改字段时不至于全断）。"""
-        try:
-            star_meta = self.context.get_registered_star("astrbot_plugin_livingmemory")
-            if star_meta is None:
-                return None
-            for attr in ("star_cls", "star", "inst", "instance", "plugin"):
-                candidate = getattr(star_meta, attr, None)
-                if candidate is not None and hasattr(candidate, "initializer"):
-                    return candidate
-            # 兜底：StarMetadata 自身可能就直接是插件对象
-            if hasattr(star_meta, "initializer"):
-                return star_meta
-            logger.warning(
-                "[LivingMemoryBridge] 找到 star 元数据但取不到插件实例，"
-                f"可用属性: {[a for a in dir(star_meta) if not a.startswith('__')][:12]}"
-            )
-        except Exception as e:
-            logger.debug(f"[LivingMemoryBridge] 获取 LivingMemory 插件对象失败: {e}")
-        return None
-
-    def _get_memory_engine(self) -> Any | None:
-        """获取 LivingMemory 引擎对象（多路径探测：插件内部属性改名时仍能找到）。"""
-        plugin = self._get_livingmemory_plugin()
-        return self._probe_member(plugin, ("memory_engine", "engine", "memory_service"), "add_memory")
-
-    def _get_conversation_manager(self) -> Any | None:
-        """获取 LivingMemory 对话管理器（多路径探测）。"""
-        plugin = self._get_livingmemory_plugin()
-        return self._probe_member(plugin, ("conversation_manager", "conv_manager"), "add_message")
-
-    @staticmethod
-    def _probe_member(plugin: Any, names: tuple[str, ...], required_method: str) -> Any | None:
-        """在插件实例与 initializer 上按候选名查找带指定方法的成员。"""
-        if plugin is None:
-            return None
-        holders = [getattr(plugin, "initializer", None), plugin]
-        for holder in holders:
-            if holder is None:
-                continue
-            for name in names:
-                candidate = getattr(holder, name, None)
-                if candidate is not None and hasattr(candidate, required_method):
-                    return candidate
-        return None
 
     # ------------------------------------------------------------------
     # 自动检测：让用户尽量不用填配置
     #
     # 会话：LivingMemory 的统计里已经按 session 列了记忆条数，取最多的那个。
-    # 身份：conversations.db 的历史消息里就有双方的账号与昵称（is_bot_message 区分）。
+    # 身份：上游会话历史里已有双方的账号与昵称（is_bot_message 区分）。
     # 只在对应配置留空时检测，且整个实例只尝试一次；失败静默降级到占位值。
     # ------------------------------------------------------------------
 
@@ -565,7 +633,7 @@ class LivingMemoryBridgeServer:
         return "我"
 
     def _persona_filtering_enabled(self) -> bool:
-        raw = self._livingmemory_config_get(
+        raw = self.upstream.config_get(
             "filtering_settings.use_persona_filtering", True
         )
         if isinstance(raw, bool):
@@ -648,67 +716,12 @@ class LivingMemoryBridgeServer:
             logger.warning(f"[LivingMemoryBridge] 写入记忆模式状态失败: {e}")
 
     def _conversation_counts(self) -> dict[str, int]:
-        """conversations.db 里每个会话的消息条数。"""
-        import sqlite3
-
-        from astrbot.api.star import StarTools
-
-        db = os.path.join(
-            str(StarTools.get_data_dir("astrbot_plugin_livingmemory")),
-            "conversations.db",
-        )
-        out: dict[str, int] = {}
-        if not os.path.exists(db):
-            return out
-        try:
-            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
-            try:
-                rows = con.execute(
-                    "SELECT session_id, COUNT(*) FROM messages "
-                    "WHERE session_id IS NOT NULL AND session_id <> '' "
-                    "GROUP BY session_id"
-                ).fetchall()
-            finally:
-                con.close()
-            for session_id, count in rows:
-                out[str(session_id)] = int(count or 0)
-        except Exception as e:
-            logger.debug(f"[LivingMemoryBridge] 读取会话消息条数失败: {e}")
-        return out
+        """每个会话的消息条数（由上游适配层读取）。"""
+        return self.upstream.conversation_counts()
 
     def _session_personas(self) -> dict[str, str]:
-        """每个会话在 documents 里出现最多的人格标签。"""
-        import sqlite3
-
-        from astrbot.api.star import StarTools
-
-        db = os.path.join(
-            str(StarTools.get_data_dir("astrbot_plugin_livingmemory")),
-            "livingmemory.db",
-        )
-        out: dict[str, str] = {}
-        if not os.path.exists(db):
-            return out
-        try:
-            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
-            try:
-                rows = con.execute(
-                    "SELECT json_extract(metadata,'$.session_id') AS sid, "
-                    "json_extract(metadata,'$.persona_id') AS p, COUNT(*) AS c "
-                    "FROM documents "
-                    "WHERE json_extract(metadata,'$.session_id') IS NOT NULL "
-                    "AND json_extract(metadata,'$.session_id') <> '' "
-                    "AND json_extract(metadata,'$.persona_id') IS NOT NULL "
-                    "AND json_extract(metadata,'$.persona_id') <> '' "
-                    "GROUP BY sid, p ORDER BY c DESC"
-                ).fetchall()
-            finally:
-                con.close()
-            for sid, persona, _count in rows:
-                out.setdefault(str(sid), str(persona))
-        except Exception as e:
-            logger.debug(f"[LivingMemoryBridge] 读取会话人格失败: {e}")
-        return out
+        """每个会话在记忆里出现最多的人格标签（由上游适配层读取）。"""
+        return self.upstream.session_personas()
 
     @staticmethod
     def _metric_count(value: Any) -> int:
@@ -722,7 +735,7 @@ class LivingMemoryBridgeServer:
         """汇总检测到的适配器与会话，供面板下拉和 /lmbridge 共用。"""
         stats_sessions: dict[str, Any] = {}
         try:
-            engine = self._get_memory_engine()
+            engine = self.upstream.engine()
             if engine is not None and hasattr(engine, "get_statistics"):
                 stats = await engine.get_statistics()
                 stats_sessions = (stats or {}).get("sessions") or {}
@@ -805,38 +818,10 @@ class LivingMemoryBridgeServer:
         cached = self._bot_session_cache.get(session_id)
         if cached:
             return cached
-        result = (self.bot_sender_id, self.bot_display_name)
-        try:
-            import os
-            import sqlite3
-
-            from astrbot.api.star import StarTools
-
-            data_dir = str(StarTools.get_data_dir("astrbot_plugin_livingmemory"))
-            db = os.path.join(data_dir, "conversations.db")
-            if os.path.exists(db):
-                con = None
-                try:
-                    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
-                    row = con.execute(
-                        "SELECT sender_id, sender_name FROM messages "
-                        "WHERE session_id=? AND sender_id IS NOT NULL AND sender_id<>'' "
-                        "AND (role='assistant' "
-                        "OR COALESCE(json_extract(metadata,'$.is_bot_message'),0)=1) "
-                        "ORDER BY id DESC LIMIT 1",
-                        (session_id,),
-                    ).fetchone()
-                finally:
-                    if con is not None:
-                        con.close()
-                if row:
-                    bid = str(row[0] or "").strip()
-                    bname = str(row[1] or "").strip() or bid
-                    if bid:
-                        result = (bid, bname)
-                        self._bot_session_cache[session_id] = result
-        except Exception as e:
-            logger.debug(f"[LivingMemoryBridge] 会话 bot 身份查询失败: {e}")
+        fallback = (self.bot_sender_id, self.bot_display_name)
+        result = self.upstream.bot_identity(session_id, fallback)
+        if result != fallback:
+            self._bot_session_cache[session_id] = result
         return result
 
     @staticmethod
@@ -1026,7 +1011,7 @@ class LivingMemoryBridgeServer:
     async def _detect_session(self) -> str | None:
         if self.usage_mode == "local":
             return None
-        engine = self._get_memory_engine()
+        engine = self.upstream.engine()
         if engine is None or not hasattr(engine, "get_statistics"):
             return None
         stats = await engine.get_statistics()
@@ -1046,30 +1031,9 @@ class LivingMemoryBridgeServer:
 
     async def _detect_persona(self, session_id: str) -> str | None:
         """解析当前会话的真实人格：优先现有记忆的主导人格，其次 AstrBot 默认人格。"""
-        import os
-        import sqlite3
-
-        from astrbot.api.star import StarTools
-
-        db = os.path.join(
-            str(StarTools.get_data_dir("astrbot_plugin_livingmemory")),
-            "livingmemory.db",
-        )
-        if os.path.exists(db):
-            con = None
-            try:
-                con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
-                row = con.execute(
-                    "SELECT json_extract(metadata,'$.persona_id') AS p, COUNT(*) AS c "
-                    "FROM documents WHERE json_extract(metadata,'$.session_id')=? "
-                    "AND p IS NOT NULL AND p <> '' GROUP BY p ORDER BY c DESC LIMIT 1",
-                    (session_id,),
-                ).fetchone()
-            finally:
-                if con is not None:
-                    con.close()
-            if row and row[0]:
-                return str(row[0])
+        persona = self.upstream.dominant_persona(session_id)
+        if persona:
+            return persona
         try:
             default = await self.context.persona_manager.get_default_persona_v3(
                 umo=session_id
@@ -1081,114 +1045,8 @@ class LivingMemoryBridgeServer:
         return None
 
     def _detect_identities(self) -> tuple[str, str, str, str] | None:
-        """从会话历史与现有记忆里读出 (bot_id, bot_name, user_id, user_name)。只读。
-
-        先查 conversations.db（role / metadata.is_bot_message 判定），跳过桌宠桥自己
-        写入的消息（source=coopanion_desktop_pet），避免自证；再回退到 LivingMemory
-        已有记忆的 participant_identities。
-        """
-        import os
-        import sqlite3
-
-        from astrbot.api.star import StarTools
-
-        data_dir = str(StarTools.get_data_dir("astrbot_plugin_livingmemory"))
-        bot = user = None
-
-        db = os.path.join(data_dir, "conversations.db")
-        if os.path.exists(db):
-            con = None
-            try:
-                con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
-                rows = con.execute(
-                    "SELECT sender_id, sender_name, role, "
-                    "COALESCE(json_extract(metadata,'$.is_bot_message'),0), "
-                    "COALESCE(json_extract(metadata,'$.source'),'') "
-                    "FROM messages WHERE sender_id IS NOT NULL AND sender_id <> '' "
-                    "ORDER BY id DESC LIMIT 500"
-                ).fetchall()
-            finally:
-                if con is not None:
-                    con.close()
-            for sid, name, role, is_bot, source in rows:
-                if str(source or "").strip() == "coopanion_desktop_pet":
-                    continue
-                sid_s = str(sid or "").strip()
-                if not sid_s.isdigit():
-                    continue
-                name_s = str(name or "").strip() or sid_s
-                if role == "assistant" or is_bot:
-                    bot = bot or (sid_s, name_s)
-                else:
-                    user = user or (sid_s, name_s)
-                if bot and user:
-                    break
-
-        fallback_bot, fallback_user = self._detect_identities_from_documents(data_dir)
-        if bot is None:
-            bot = fallback_bot
-        elif fallback_bot and (not bot[1] or bot[1].isdigit()):
-            bot = (bot[0], fallback_bot[1])
-        if user is None:
-            user = fallback_user
-        elif fallback_user and (not user[1] or user[1].isdigit()):
-            user = (user[0], fallback_user[1])
-        if bot is None and user is None:
-            return None
-        b = bot or ("", "")
-        u = user or ("", "")
-        return (b[0], b[1], u[0], u[1])
-
-    def _detect_identities_from_documents(
-        self, data_dir: str
-    ) -> tuple[tuple[str, str] | None, tuple[str, str] | None]:
-        """从 LivingMemory 现有记忆的 participant_identities 里反查双方身份。"""
-        import os
-        import sqlite3
-
-        db = os.path.join(data_dir, "livingmemory.db")
-        if not os.path.exists(db):
-            return (None, None)
-        con = None
-        try:
-            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
-            rows = con.execute(
-                "SELECT json_extract(je.value,'$.identity_key'), "
-                "json_extract(je.value,'$.display_name'), "
-                "json_extract(je.value,'$.is_bot'), COUNT(*) AS c "
-                "FROM documents d, json_each(d.metadata,'$.participant_identities') je "
-                "GROUP BY 1,2,3 ORDER BY c DESC"
-            ).fetchall()
-        except Exception as e:
-            logger.debug(f"[LivingMemoryBridge] 读取记忆参与者失败: {e}")
-            return (None, None)
-        finally:
-            if con is not None:
-                con.close()
-
-        user_id = self._session_user_id()
-        bot = user = None
-        for key, name, is_bot, _count in rows:
-            key_s = str(key or "").strip()
-            if ":" not in key_s:
-                continue
-            platform_part, _, id_part = key_s.partition(":")
-            if not platform_part or not id_part:
-                continue
-            name_s = str(name or "").strip()
-            if is_bot and bot is None:
-                bot = (id_part, name_s or id_part)
-            elif not is_bot and user is None:
-                if not user_id or id_part == user_id:
-                    if name_s and not name_s.isdigit():
-                        user = (id_part, name_s)
-                    elif user_id:
-                        user = (id_part, user_id)
-            if bot and user:
-                break
-        if user is None and user_id:
-            user = (user_id, user_id)
-        return (bot, user)
+        """从会话历史与现有记忆里读出 (bot_id, bot_name, user_id, user_name)。只读。"""
+        return self.upstream.detect_identities(self._session_user_id())
 
     def _session_user_id(self) -> str:
         """从默认会话 umo 里取用户数字账号（排除 bot 账号）。"""
@@ -1246,63 +1104,27 @@ class LivingMemoryBridgeServer:
     #
     # 依赖的是 MemoryReflection 的三个方法（其中两个不接收 event）：
     #   _read_session_revision / _build_reflection_plan_for_cursor / _schedule_reflection
-    # 插件升级若改名，_get_reflection 的多路径探测会失败并在回执里指出缺哪个符号。
+    # 插件升级若改名，适配层的反思组件发现会失败并在回执里指出缺哪个符号。
     # ------------------------------------------------------------------
-
-    def _get_reflection(self) -> Any | None:
-        """取 MemoryReflection 实例（多路径探测，兼容插件内部结构改名）。"""
-        plugin = self._get_livingmemory_plugin()
-        if not plugin:
-            return None
-        holders = []
-        for holder_name in ("event_handler", "_event_handler"):
-            holder = getattr(plugin, holder_name, None)
-            if holder is not None:
-                holders.append(holder)
-            init = getattr(plugin, "initializer", None)
-            if init is not None:
-                nested = getattr(init, holder_name, None)
-                if nested is not None:
-                    holders.append(nested)
-        for holder in holders:
-            for attr in ("_memory_reflection", "memory_reflection", "reflection"):
-                candidate = getattr(holder, attr, None)
-                if candidate is not None and hasattr(
-                    candidate, "_build_reflection_plan_for_cursor"
-                ):
-                    return candidate
-        return None
-
-    def _livingmemory_config_get(self, key: str, default: Any) -> Any:
-        """读 LivingMemory 的配置项（读不到就用默认值）。"""
-        plugin = self._get_livingmemory_plugin()
-        for holder in (plugin, getattr(plugin, "initializer", None) if plugin else None):
-            cm = getattr(holder, "config_manager", None) if holder else None
-            if cm is not None and hasattr(cm, "get"):
-                try:
-                    return cm.get(key, default)
-                except Exception:
-                    continue
-        return default
 
     async def _run_reflection(
         self, session_id: str, persona_id: str | None = None
     ) -> dict[str, Any]:
         """按 LivingMemory 的规则判断是否该总结；需要时调度后台任务。"""
         persona = str(persona_id or "").strip() or self.default_persona_id
-        mr = self._get_reflection()
-        cm = self._get_conversation_manager()
+        mr = self.upstream.reflection_component()
+        cm = self.upstream.conversation_api()
         if mr is None:
             return {
                 "ok": False,
                 "error": "拿不到 LivingMemory 的记忆反思模块（插件可能升级改名）",
-                "hint": "检查 astrbot_plugin_livingmemory 版本；桥的 _get_reflection 需适配新的属性名",
+                "hint": "检查 astrbot_plugin_livingmemory 版本；桥的上游适配层需适配新的属性名",
             }
         if cm is None:
             return {"ok": False, "error": "ConversationManager 尚未就绪"}
 
         scope_mode = str(
-            self._livingmemory_config_get("filtering_settings.memory_scope_mode", "legacy")
+            self.upstream.config_get("filtering_settings.memory_scope_mode", "legacy")
         ).casefold()
         if scope_mode not in ("legacy", "session"):
             return {
@@ -1317,7 +1139,7 @@ class LivingMemoryBridgeServer:
             last = await cm.get_session_metadata(session_id, "last_summarized_index", 0)
             pending = await cm.get_session_metadata(session_id, "pending_summary", None)
             threshold = int(
-                self._livingmemory_config_get("reflection_engine.summary_trigger_rounds", 10)
+                self.upstream.config_get("reflection_engine.summary_trigger_rounds", 10)
             )
             unsummarized = max(0, (int(total) - int(last or 0)) // 2)
             if unsummarized < threshold:
@@ -1709,72 +1531,34 @@ class LivingMemoryBridgeServer:
         self, old_persona: str, new_persona: str, dry_run: bool = True
     ) -> dict[str, Any]:
         """把旧人格标签迁移到新人格（documents / graph_entries / memory_atoms）。"""
-        old = str(old_persona or "").strip()
-        new = str(new_persona or "").strip()
-        if not old or not new:
-            return {"ok": False, "error": "需要提供旧人格和新人格"}
-        if old == new:
-            return {"ok": False, "error": "新旧人格相同"}
-        engine = self._get_memory_engine()
-        conn = getattr(engine, "db_connection", None) if engine else None
-        if conn is None:
-            return {"ok": False, "error": "记忆引擎数据库连接未就绪"}
-        try:
-            async def _count(sql: str) -> int:
-                cursor = await conn.execute(sql, (old,))
-                row = await cursor.fetchone()
-                return int(row[0]) if row and row[0] is not None else 0
+        return await self.upstream.migrate_persona(
+            self.upstream.engine(), old_persona, new_persona, dry_run
+        )
 
-            docs = await _count(
-                "SELECT COUNT(*) FROM documents "
-                "WHERE json_extract(metadata,'$.persona_id')=?"
-            )
-            entries = await _count(
-                "SELECT COUNT(*) FROM graph_entries WHERE persona_id=?"
-            )
-            atoms = await _count(
-                "SELECT COUNT(*) FROM memory_atoms WHERE persona_id=?"
-            )
-            result: dict[str, Any] = {
-                "ok": True,
-                "old": old,
-                "new": new,
-                "dry_run": dry_run,
-                "documents": docs,
-                "graph_entries": entries,
-                "memory_atoms": atoms,
-            }
-            if dry_run or not (docs or entries or atoms):
-                return result
-            await conn.execute(
-                "UPDATE documents SET metadata=json_set(metadata,'$.persona_id',?) "
-                "WHERE json_extract(metadata,'$.persona_id')=?",
-                (new, old),
-            )
-            await conn.execute(
-                "UPDATE graph_entries SET persona_id=?, "
-                "metadata=json_set(metadata,'$.persona_id',?) WHERE persona_id=?",
-                (new, new, old),
-            )
-            await conn.execute(
-                "UPDATE memory_atoms SET persona_id=? WHERE persona_id=?",
-                (new, old),
-            )
-            await conn.commit()
-            result["migrated"] = True
-            logger.info(
-                f"[LivingMemoryBridge] 人格迁移完成: {old} -> {new}, "
-                f"documents={docs}, graph_entries={entries}, atoms={atoms}"
-            )
-            return result
-        except Exception as e:
-            logger.error(f"[LivingMemoryBridge] 人格迁移失败: {e}", exc_info=True)
-            return {"ok": False, "error": str(e)}
+    def _capability_block_response(
+        self, kind: str, action: str
+    ) -> web.Response | None:
+        reason = self.upstream.write_block_reason(kind)
+        if not reason:
+            return None
+        return web.json_response(
+            {
+                "ok": False,
+                "error": f"{action}已拒绝：{reason}",
+                "upstream": self.upstream.capability_summary(),
+            },
+            status=503,
+        )
+
+    def _write_block_response(self, kind: str) -> web.Response | None:
+        return self._capability_block_response(kind, "写入")
 
     async def handle_health(self, request: web.Request) -> web.Response:
         """GET /api/health - 探针与状态"""
+        # 健康检查主动失效能力缓存，避免启动期把“尚未初始化”永久当成“不兼容”。
+        self.upstream.refresh()
         await self._ensure_auto()
-        engine = self._get_memory_engine()
+        engine = self.upstream.engine()
         connected = engine is not None
 
         stats_data = {}
@@ -1785,13 +1569,36 @@ class LivingMemoryBridgeServer:
             except Exception as e:
                 stats_data = {"error": str(e)}
 
+        capability = self.upstream.capability_summary()
+        # 动态判定当前实例状态 (D-04)
+        if self.state not in ("port_conflict", "failed", "external_owner"):
+            if connected:
+                self.state = "ready"
+            else:
+                self.state = "upstream_pending"
+
         return web.json_response(
             {
                 "ok": True,
+                "state": self.state,
+                "bridge_instance_id": self.bridge_instance_id,
+                "pid": os.getpid(),
+                "started_at": self.started_at,
+                "schema_version": SCHEMA_VERSION,
+                "tools_schema_version": TOOLS_SCHEMA_VERSION,
+                "plugin_version": VERSION,
+                "upstream": {
+                    "ready": connected,
+                    "version": capability["upstream_version"],
+                    "capabilities": capability["capabilities"],
+                },
                 "plugin": "astrbot_plugin_coopanion_livingmemory",
                 "version": VERSION,
+                "upstream_version": capability["upstream_version"],
+                "upstream_capabilities": capability["capabilities"],
+                "upstream_capability_warning": capability["warning"],
                 "livingmemory_connected": connected,
-                "reflection_available": self._get_reflection() is not None,
+                "reflection_available": self.upstream.reflection_component() is not None,
                 "auto_reflection": self.enable_auto_reflection,
                 "usage_mode": self.usage_mode,
                 "default_session_id": self.default_session_id,
@@ -1829,13 +1636,60 @@ class LivingMemoryBridgeServer:
             }
         )
 
+    async def handle_manifest(self, request: web.Request) -> web.Response:
+        """GET /api/tools/manifest - 动态暴露工具面定义与可用性目录 (A-02)"""
+        self.upstream.refresh()
+        tools_list = []
+        catalog_list = []
+
+        for t_name, t_def in TOOLS_DEF.items():
+            avail, reason = self.upstream.get_tool_availability(t_name)
+            tool_entry = {
+                "name": t_def["name"],
+                "endpoint": t_def["endpoint"],
+                "http_method": t_def["http_method"],
+                "capability": t_def["capability"],
+                "mode": t_def["mode"],
+                "permission": t_def["permission"],
+                "tags": t_def["tags"],
+                "description": t_def["description"],
+                "parameters": t_def["parameters"],
+            }
+            catalog_entry = dict(tool_entry)
+            catalog_entry["available"] = avail
+            catalog_entry["reason"] = reason
+            catalog_list.append(catalog_entry)
+
+            if avail:
+                tools_list.append(tool_entry)
+
+        # 签名与 revision (LM-E2E-06 热更新检测)
+        raw_rev = f"{SCHEMA_VERSION}_{VERSION}_{self.upstream.upstream_version()}_" + "_".join(t["name"] for t in tools_list)
+        rev = hashlib.sha256(raw_rev.encode()).hexdigest()[:12]
+
+        return web.json_response(
+            {
+                "ok": True,
+                "schema_version": SCHEMA_VERSION,
+                "tools_schema_version": TOOLS_SCHEMA_VERSION,
+                "revision": rev,
+                "bridge_version": VERSION,
+                "upstream_version": self.upstream.upstream_version(),
+                "tools": tools_list,
+                "catalog": catalog_list,
+            }
+        )
+
     async def handle_search(self, request: web.Request) -> web.Response:
-        """POST /api/memory/search - 多路混合语义与图谱检索"""
+        """POST /api/memory/search - 多路混合语义与图谱检索 (A-01, mem_search)"""
         await self._ensure_auto()
-        engine = self._get_memory_engine()
+        blocked = self._capability_block_response("search", "检索")
+        if blocked is not None:
+            return blocked
+        engine = self.upstream.engine()
         if not engine:
             return web.json_response(
-                {"ok": False, "error": "LivingMemory 引擎尚未就绪或不可用"},
+                {"ok": False, "code": "tool_not_ready", "error": "LivingMemory 引擎尚未就绪或不可用"},
                 status=503,
             )
 
@@ -1843,16 +1697,16 @@ class LivingMemoryBridgeServer:
             data = await request.json()
         except Exception:
             return web.json_response(
-                {"ok": False, "error": "无效的 JSON 请求体"}, status=400
+                {"ok": False, "code": "invalid_json", "error": "无效的 JSON 请求体"}, status=400
             )
 
-        query = data.get("query", "").strip()
-        if not query:
-            return web.json_response(
-                {"ok": False, "error": "query 不能为空"}, status=400
-            )
+        # 严格契约参数校验 (D-01, LM-E2E-18, LM-E2E-19)
+        valid, err = validate_tool_params("mem_search", data)
+        if not valid and err:
+            return web.json_response(err, status=422)
 
-        limit = int(data.get("limit", 5))
+        query = str(data.get("query", "")).strip()
+        limit = max(1, min(20, int(data.get("limit", 5))))
         session_id = data.get("session_id") or self.default_session_id
         persona_id = self._effective_persona(data.get("persona_id"))
 
@@ -1882,15 +1736,18 @@ class LivingMemoryBridgeServer:
             )
         except Exception as e:
             logger.error(f"[LivingMemoryBridge] 检索失败: {e}", exc_info=True)
-            return web.json_response({"ok": False, "error": str(e)}, status=500)
+            return web.json_response({"ok": False, "code": "internal_error", "error": str(e)}, status=500)
 
     async def handle_add(self, request: web.Request) -> web.Response:
-        """POST /api/memory/add - 添加记忆记录"""
+        """POST /api/memory/add - 添加记忆记录 (轻量直写，mem_record)"""
         await self._ensure_auto()
-        engine = self._get_memory_engine()
+        blocked = self._write_block_response("memory")
+        if blocked is not None:
+            return blocked
+        engine = self.upstream.engine()
         if not engine:
             return web.json_response(
-                {"ok": False, "error": "LivingMemory 引擎尚未就绪或不可用"},
+                {"ok": False, "code": "tool_not_ready", "error": "LivingMemory 引擎尚未就绪或不可用"},
                 status=503,
             )
 
@@ -1898,16 +1755,16 @@ class LivingMemoryBridgeServer:
             data = await request.json()
         except Exception:
             return web.json_response(
-                {"ok": False, "error": "无效的 JSON 请求体"}, status=400
+                {"ok": False, "code": "invalid_json", "error": "无效的 JSON 请求体"}, status=400
             )
 
-        content = data.get("content", "").strip()
-        if not content:
-            return web.json_response(
-                {"ok": False, "error": "content 不能为空"}, status=400
-            )
+        # 严格契约校验 (D-01, LM-E2E-20)
+        valid, err = validate_tool_params("mem_record", data)
+        if not valid and err:
+            return web.json_response(err, status=422)
 
-        importance = float(data.get("importance", 0.5))
+        content = str(data.get("content", "")).strip()
+        importance = float(data.get("importance", 0.6))
         session_id = data.get("session_id") or self.default_session_id
         persona_id = self._effective_persona(data.get("persona_id"))
         platform = self._session_platform(session_id, data.get("platform"))
@@ -1923,6 +1780,8 @@ class LivingMemoryBridgeServer:
             metadata["source"] = "coopanion_pet"
         if "adapter_id" not in metadata:
             metadata["adapter_id"] = self.default_adapter_id
+        # 区分两条写入通道 (2.2 & LM-E2E-08)
+        metadata["memory_origin"] = "pet_mem_record"
         metadata = self._enrich_metadata(
             content,
             session_id,
@@ -1945,12 +1804,406 @@ class LivingMemoryBridgeServer:
             return web.json_response({"ok": True, "memory_id": memory_id})
         except Exception as e:
             logger.error(f"[LivingMemoryBridge] 添加记忆失败: {e}", exc_info=True)
-            return web.json_response({"ok": False, "error": str(e)}, status=500)
+            return web.json_response({"ok": False, "code": "internal_error", "error": str(e)}, status=500)
+
+    async def handle_memorize(self, request: web.Request) -> web.Response:
+        """POST /api/memory/memorize - 深度结构化记忆沉淀 (A-03, mem_memorize)"""
+        await self._ensure_auto()
+        avail, reason = self.upstream.is_memorize_enabled()
+        if not avail:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "code": "tool_disabled",
+                    "tool": "mem_memorize",
+                    "message": reason,
+                    "reason": reason,
+                },
+                status=403,
+            )
+        engine = self.upstream.engine()
+        processor = self.upstream.memory_processor()
+        if not engine or not processor:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "code": "tool_not_ready",
+                    "tool": "mem_memorize",
+                    "message": "记忆引擎或处理器未就绪",
+                },
+                status=503,
+            )
+
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response(
+                {"ok": False, "code": "invalid_json", "message": "无效的 JSON 请求体"},
+                status=400,
+            )
+
+        valid, err = validate_tool_params("mem_memorize", data)
+        if not valid and err:
+            return web.json_response(err, status=422)
+
+        content = str(data.get("content", "")).strip()
+        topics = data.get("topics") or []
+        key_facts = data.get("key_facts") or []
+        sentiment = str(data.get("sentiment") or "neutral").strip().lower()
+        if sentiment not in {"positive", "neutral", "negative"}:
+            sentiment = "neutral"
+        importance = float(data.get("importance", 0.7))
+        reason_text = str(data.get("reason", "")).strip()
+        session_id = str(data.get("session_id") or self.default_session_id)
+        persona_id = self._effective_persona(data.get("persona_id"))
+
+        is_group_chat = "GroupMessage" in session_id
+        structured_data = {
+            "summary": content,
+            "topics": [str(t).strip() for t in topics if str(t).strip()][:5],
+            "key_facts": [str(f).strip() for f in key_facts if str(f).strip()][:5],
+            "sentiment": sentiment,
+            "importance": importance,
+        }
+
+        try:
+            processed_content, metadata, normalized_importance = (
+                processor.build_memory_from_structured_data(
+                    structured_data=structured_data,
+                    is_group_chat=is_group_chat,
+                    fallback_excerpt=content,
+                )
+            )
+            metadata["source_window"] = {
+                "session_id": session_id,
+                "triggered_by": "bridge_tool",
+                "tool_name": "mem_memorize",
+            }
+            metadata["memory_origin"] = "bridge_memorize"
+            metadata["source_session_id"] = session_id
+            if reason_text:
+                metadata["memorize_reason"] = reason_text
+
+            memory_id = await engine.add_memory(
+                content=processed_content,
+                session_id=session_id,
+                persona_id=persona_id,
+                importance=normalized_importance,
+                metadata=metadata,
+            )
+            return web.json_response(
+                {
+                    "ok": True,
+                    "memory_id": memory_id,
+                    "content": processed_content,
+                    "importance": normalized_importance,
+                    "session_id": session_id,
+                    "persona_id": persona_id,
+                    "topics": structured_data["topics"],
+                    "status": "memorized",
+                }
+            )
+        except Exception as e:
+            logger.error(f"[LivingMemoryBridge] memorize 写入失败: {e}", exc_info=True)
+            return web.json_response(
+                {"ok": False, "code": "internal_error", "message": str(e)},
+                status=500,
+            )
+
+    async def handle_recall(self, request: web.Request) -> web.Response:
+        """POST /api/memory/recall - 专注精准召回 (A-04, mem_recall)"""
+        await self._ensure_auto()
+        avail, reason = self.upstream.is_recall_enabled()
+        if not avail:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "code": "tool_disabled",
+                    "tool": "mem_recall",
+                    "message": reason,
+                    "reason": reason,
+                },
+                status=403,
+            )
+        engine = self.upstream.engine()
+        if not engine:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "code": "tool_not_ready",
+                    "tool": "mem_recall",
+                    "message": "记忆引擎尚未就绪",
+                },
+                status=503,
+            )
+
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response(
+                {"ok": False, "code": "invalid_json", "message": "无效的 JSON 请求体"},
+                status=400,
+            )
+
+        valid, err = validate_tool_params("mem_recall", data)
+        if not valid and err:
+            return web.json_response(err, status=422)
+
+        query = str(data.get("query", "")).strip()
+        limit = max(1, min(20, int(data.get("limit", 5))))
+        include_source = bool(data.get("include_source", False))
+        target = str(data.get("target") or "conversation").strip()
+        session_id = str(data.get("session_id") or self.default_session_id)
+        persona_id = self._effective_persona(data.get("persona_id"))
+
+        if target == "current_speaker":
+            beta_ok, beta_reason = self.upstream.is_agentic_recall_enabled()
+            if not beta_ok:
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "code": "tool_disabled",
+                        "tool": "mem_recall",
+                        "message": "target='current_speaker' 模式需要开启 agentic recall beta",
+                        "reason": beta_reason,
+                    },
+                    status=403,
+                )
+
+        try:
+            memories = await engine.search_memories(
+                query=query,
+                k=limit,
+                session_id=session_id,
+                persona_id=persona_id,
+            )
+            serialized = []
+            for m in memories:
+                meta = m.metadata if isinstance(m.metadata, dict) else {}
+                item = {
+                    "id": getattr(m, "doc_id", None),
+                    "content": getattr(m, "content", ""),
+                    "score": getattr(m, "final_score", 0.0),
+                    "importance": meta.get("importance"),
+                    "session_id": meta.get("session_id"),
+                    "persona_id": meta.get("persona_id"),
+                    "create_time": meta.get("create_time"),
+                }
+                if include_source and meta.get("has_source"):
+                    get_source = getattr(engine, "get_memory_source", None)
+                    if callable(get_source):
+                        item["source_messages"] = await get_source(m.doc_id)
+                serialized.append(item)
+
+            return web.json_response(
+                {
+                    "ok": True,
+                    "query": query,
+                    "count": len(serialized),
+                    "results": serialized,
+                }
+            )
+        except Exception as e:
+            logger.error(f"[LivingMemoryBridge] recall 失败: {e}", exc_info=True)
+            return web.json_response(
+                {"ok": False, "code": "internal_error", "message": str(e)},
+                status=500,
+            )
+
+    async def handle_evidence(self, request: web.Request) -> web.Response:
+        """POST /api/memory/evidence - 按 memory_id 深读记忆事实与原文 (A-05, mem_evidence)"""
+        await self._ensure_auto()
+        avail, reason = self.upstream.is_evidence_enabled()
+        if not avail:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "code": "tool_disabled",
+                    "tool": "mem_evidence",
+                    "message": reason,
+                    "reason": reason,
+                },
+                status=403,
+            )
+        engine = self.upstream.engine()
+        if not engine:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "code": "tool_not_ready",
+                    "tool": "mem_evidence",
+                    "message": "记忆引擎尚未就绪",
+                },
+                status=503,
+            )
+
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response(
+                {"ok": False, "code": "invalid_json", "message": "无效的 JSON 请求体"},
+                status=400,
+            )
+
+        valid, err = validate_tool_params("mem_evidence", data)
+        if not valid and err:
+            return web.json_response(err, status=422)
+
+        memory_id = int(data.get("memory_id"))
+        include_source = bool(data.get("include_source", False))
+        cursor = str(data.get("cursor", "")).strip()
+
+        try:
+            import sys
+            from pathlib import Path
+            try:
+                from astrbot_plugin_livingmemory.core.tools.memory_evidence_reader import read_memory_evidence_core
+                from astrbot_plugin_livingmemory.core.tools.memory_evidence_output import paginate_evidence
+            except ImportError:
+                up_dir = str(Path(self.upstream._data_dir()).parent.parent / "plugins" / "astrbot_plugin_livingmemory")
+                if up_dir not in sys.path:
+                    sys.path.insert(0, up_dir)
+                from core.tools.memory_evidence_reader import read_memory_evidence_core
+                from core.tools.memory_evidence_output import paginate_evidence
+
+            doc = await read_memory_evidence_core(
+                memory_engine=engine,
+                recall_session_id=self.default_session_id,
+                recall_persona_id=self.default_persona_id,
+                memory_id=memory_id,
+                include_source=include_source,
+            )
+            if doc.get("status") == "not_found":
+                return web.json_response(
+                    {"ok": False, "code": "not_found", "message": f"记忆 ID {memory_id} 未找到或不可见"},
+                    status=404,
+                )
+            if cursor:
+                doc = paginate_evidence(doc, cursor=cursor)
+            return web.json_response({"ok": True, **doc})
+        except Exception as e:
+            logger.error(f"[LivingMemoryBridge] evidence 读取失败: {e}", exc_info=True)
+            return web.json_response(
+                {"ok": False, "code": "internal_error", "message": str(e)},
+                status=500,
+            )
+
+    async def handle_forget(self, request: web.Request) -> web.Response:
+        """POST /api/memory/forget - 记忆软删除/归档 (A-06, mem_forget)"""
+        await self._ensure_auto()
+        avail, reason = self.upstream.is_forget_enabled()
+        if not avail:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "code": "tool_disabled",
+                    "tool": "mem_forget",
+                    "message": reason,
+                    "reason": reason,
+                },
+                status=403,
+            )
+        engine = self.upstream.engine()
+        if not engine:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "code": "tool_not_ready",
+                    "tool": "mem_forget",
+                    "message": "记忆引擎尚未就绪",
+                },
+                status=503,
+            )
+
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response(
+                {"ok": False, "code": "invalid_json", "message": "无效的 JSON 请求体"},
+                status=400,
+            )
+
+        valid, err = validate_tool_params("mem_forget", data)
+        if not valid and err:
+            return web.json_response(err, status=422)
+
+        memory_ids = data.get("memory_ids") or []
+        if not memory_ids:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "code": "missing_field",
+                    "field": "memory_ids",
+                    "message": "memory_ids 不能为空",
+                },
+                status=422,
+            )
+
+        max_memories = int(self.upstream.config_get("agent_tools.forget_tool_max_memories", 3))
+        if len(memory_ids) > max_memories:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "code": "limit_exceeded",
+                    "message": f"单次最多只能归档 {max_memories} 条记忆，实际传入 {len(memory_ids)} 条",
+                    "max_memories": max_memories,
+                },
+                status=400,
+            )
+
+        # 权限校验：仅管理员可调用 (LM-E2E-11)
+        # 配置缺失时不放行，避免未设置 admins_id 时任何人都能归档记忆。
+        requester_id = str(data.get("user_id") or self._session_user_id() or "")
+        admins: list[str] = []
+        if self.context and hasattr(self.context, "astrbot_config"):
+            raw_admins = self.context.astrbot_config.get("admins_id") or []
+            admins = [str(a).strip() for a in raw_admins if str(a).strip()]
+        if not admins or (requester_id and requester_id not in admins):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "code": "permission_denied",
+                    "message": "未配置管理员或当前用户无权限执行遗忘操作",
+                },
+                status=403,
+            )
+
+        reason_text = str(data.get("reason", "")).strip()
+        try:
+            archived_count = await engine.archive_memories(
+                memory_ids,
+                audit={
+                    "archived_by": "bridge_tool",
+                    "archive_reason": reason_text,
+                    "session_id": self.default_session_id,
+                },
+            )
+            return web.json_response(
+                {
+                    "ok": True,
+                    "action": "archived",
+                    "archived_count": archived_count,
+                    "memory_ids": memory_ids,
+                    "audit": {
+                        "reason": reason_text,
+                        "archived_by": "bridge_tool",
+                    },
+                }
+            )
+        except Exception as e:
+            logger.error(f"[LivingMemoryBridge] 归档记忆失败: {e}", exc_info=True)
+            return web.json_response(
+                {"ok": False, "code": "internal_error", "message": str(e)},
+                status=500,
+            )
 
     async def handle_batch_add(self, request: web.Request) -> web.Response:
         """POST /api/memory/batch_add - 批量添加记忆（用于初始化迁移与批量同步）"""
         await self._ensure_auto()
-        engine = self._get_memory_engine()
+        blocked = self._write_block_response("memory")
+        if blocked is not None:
+            return blocked
+        engine = self.upstream.engine()
         if not engine:
             return web.json_response(
                 {"ok": False, "error": "LivingMemory 引擎尚未就绪或不可用"},
@@ -2026,6 +2279,9 @@ class LivingMemoryBridgeServer:
     async def handle_reflect(self, request: web.Request) -> web.Response:
         """POST /api/memory/reflect - 对桌宠会话做一次记忆蒸馏判定（达标才总结）"""
         await self._ensure_auto()
+        blocked = self._write_block_response("reflect")
+        if blocked is not None:
+            return blocked
         try:
             data = await request.json()
         except Exception:
@@ -2040,7 +2296,10 @@ class LivingMemoryBridgeServer:
     async def handle_chat(self, request: web.Request) -> web.Response:
         """POST /api/memory/chat - 接收桌宠端对话流注入会话窗口"""
         await self._ensure_auto()
-        conv_mgr = self._get_conversation_manager()
+        blocked = self._write_block_response("chat")
+        if blocked is not None:
+            return blocked
+        conv_mgr = self.upstream.conversation_api()
         if not conv_mgr:
             return web.json_response(
                 {"ok": False, "error": "ConversationManager 尚未就绪"}, status=503
@@ -2218,23 +2477,57 @@ class LivingMemoryBridgeServer:
         return web.json_response(payload)
 
     async def start(self):
-        """启动 HTTP 桥服务"""
+        """启动 HTTP 桥服务，实现单实例锁与状态机 (D-04, D-05)"""
+        self.state = "starting"
+        # 1. 探测端口是否已被活实例占用
+        status, data = await self._probe_port()
+        if status == "reuse":
+            self.state = "external_owner"
+            ext_inst = data.get("bridge_instance_id") if data else "unknown"
+            logger.info(
+                f"[LivingMemoryBridge] 检测到同协议活实例已在运行 (instance={ext_inst})，复用现有服务 (external_owner)"
+            )
+            return
+        elif status == "conflict":
+            self.state = "port_conflict"
+            logger.warning(
+                f"[LivingMemoryBridge] 端口 {self.port} 被外部未知服务占用，状态置为 port_conflict，禁止强杀外部进程"
+            )
+            return
+
+        # 2. 抢锁
+        self._acquire_lock()
+
+        # 3. 启动 aiohttp 服务
         try:
             self._runner = web.AppRunner(self.app)
             await self._runner.setup()
             self._site = web.TCPSite(self._runner, self.host, self.port)
             await self._site.start()
+            if self.upstream.capability("engine").enabled:
+                self.state = "ready"
+            else:
+                self.state = "upstream_pending"
             logger.info(
-                f"[LivingMemoryBridge] HTTP 桥服务已成功启动: http://{self.host}:{self.port}"
+                f"[LivingMemoryBridge] HTTP 桥服务已成功启动: http://{self.host}:{self.port} (state={self.state}, instance={self.bridge_instance_id})"
             )
+        except OSError as e:
+            self.state = "port_conflict"
+            self._release_lock()
+            logger.error(f"[LivingMemoryBridge] 端口绑定冲突 (http://{self.host}:{self.port}): {e}")
         except Exception as e:
+            self.state = "failed"
+            self._release_lock()
             logger.error(
                 f"[LivingMemoryBridge] 启动 HTTP 桥服务失败 (http://{self.host}:{self.port}): {e}",
                 exc_info=True,
             )
 
     async def stop(self):
-        """停止 HTTP 桥服务"""
+        """停止 HTTP 桥服务并释放单实例锁"""
+        if self.state == "external_owner":
+            self.state = "stopped"
+            return
         if self._runner:
             try:
                 await self._runner.cleanup()
@@ -2244,3 +2537,5 @@ class LivingMemoryBridgeServer:
             finally:
                 self._runner = None
                 self._site = None
+        self._release_lock()
+        self.state = "stopped"

@@ -2,6 +2,30 @@
 
 本文件记录「LivingMemory 桌宠直连桥接 (astrbot_plugin_coopanion_livingmemory)」插件的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.2] - 2026-11-12
+
+### 新增
+
+- **完整 LivingMemory 协议实现（本版最重的一条）**：0.2.0 只接了 `/api/memory/search`、`/api/memory/add`、`/api/memory/chat`、`/api/memory/reflect` 四条，记录只能落轻量条目，召回只能靠综合检索，既读不到证据也删不掉东西，桌宠侧因此一直只有三个工具。这次补齐：
+  - `/api/memory/memorize`：走记忆引擎的深度处理器，产出结构化关键事实与情感倾向；
+  - `/api/memory/recall`：精准召回，支持限定到当前说话人；
+  - `/api/memory/evidence`：按记忆编号返回有效事实与原文证据，支持游标分页；
+  - `/api/memory/forget`：归档软删除，数据库里仍可恢复。
+- **工具清单下发**：新增 `/api/tools/manifest`，把 7 个工具的字段、必填项、说明和契约版本一起下发，与桌宠侧动态生成工具对齐；协议字段、工具 schema 与版本号由同一份 `contract.json` 派生。
+- **严格契约校验**：握手时校验 `schema_version` / `tools_schema_version`，不匹配直接拒绝并回明确原因，不再静默降级。
+- **单实例锁**：同一端口只允许一份桥接进程运行，重复启动会明确报错退出，避免两个实例抢 `127.0.0.1:6198`。
+- **能力分级降级**：上游能力探测按等级判定，缺少某项能力时只在相关接口降级，并把降级原因写进回执。
+- **检索门禁**：上游未就绪时检索请求按门禁拒绝并给出原因，不再返回空结果冒充"没有记忆"。
+
+### 修复
+
+- 上游能力探测在 LivingMemory 插件初始化完成前只探一次就判死，改为初始化后重试。
+- 私有属性探测收口到 adapter 一处，并增加表结构校验，避免上游改版后静默失败。
+
+### 变更
+
+- 插件图标由 `icon.svg` 改为 `logo.png`（512×512，体积压到 512KB 以内）。
+
 ## [0.2.0] - 2026-11-07
 
 ### 新增

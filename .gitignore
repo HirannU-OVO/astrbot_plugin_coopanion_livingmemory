@@ -1,4 +1,15 @@
-node_modules/
 __pycache__/
 *.pyc
+.venv/
+venv/
+node_modules/
 .idea/
+.vscode/
+*.log
+data/
+cache/
+
+# Standard exclusions
+logs/
+config.json
+.bak/

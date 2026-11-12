@@ -66,9 +66,11 @@ class LivingMemoryBridgePlugin(Star):
         async def _run():
             try:
                 await self.server.start()
-                # 服务起来后在后台做一次识别，结果直接写回插件配置，面板即可确认/修改
-                self._bg_init_task = asyncio.create_task(self._auto_init())
+                if self.server.state in ("ready", "upstream_pending", "starting"):
+                    # 服务起来后在后台做一次识别，结果直接写回插件配置，面板即可确认/修改
+                    self._bg_init_task = asyncio.create_task(self._auto_init())
             except Exception as e:
+                self.server.state = "failed"
                 logger.error(f"[LivingMemoryBridge] 服务启动异常: {e}", exc_info=True)
 
         self._bg_task = asyncio.create_task(_run())
@@ -78,9 +80,13 @@ class LivingMemoryBridgePlugin(Star):
         ready = False
         for _ in range(30):
             try:
+                # 上游 LivingMemory 可能晚于桥接初始化；每次重试都重新探测能力。
+                self.server.upstream.refresh()
                 await self.server._ensure_auto()
                 if self.server._auto_ready:
                     ready = True
+                    if self.server.state == "upstream_pending" and self.server.upstream.capability("engine").enabled:
+                        self.server.state = "ready"
                     logger.info(
                         "[LivingMemoryBridge] 启动期自动识别完成，识别结果已写入插件配置"
                     )
@@ -113,7 +119,12 @@ class LivingMemoryBridgePlugin(Star):
         new: str = "",
         mode: str = "",
     ):
-        """查询桥接状态；/lmbridge migrate-persona <旧人格> <新人格> [apply]"""
+        """查询桥接状态；/lmbridge migrate-persona <旧人格> <新人格> [apply]；/lmbridge doctor"""
+        if action.casefold() == "doctor":
+            self.server.upstream.refresh()
+            yield event.plain_result(self.server.upstream.capability_report())
+            return
+
         if action.casefold() in ("migrate-persona", "migrate_persona"):
             if not old or not new:
                 yield event.plain_result(
@@ -128,7 +139,7 @@ class LivingMemoryBridgePlugin(Star):
             )
             return
 
-        engine = self.server._get_memory_engine()
+        engine = self.server.upstream.engine()
         connected = engine is not None
 
         stats_text = "未连接"
@@ -163,6 +174,10 @@ class LivingMemoryBridgePlugin(Star):
             f"\n适配器实例名: {adapter_instance or '未识别'}"
             f"\n平台类型: {platform_type}"
         )
+        self.server.upstream.refresh()
+        capability = self.server.upstream.capability_summary()
+        if capability["warning"]:
+            msg += "\n" + capability["warning"]
         try:
             overview = await self.server.get_session_overview()
             sessions = overview.get("sessions") or []

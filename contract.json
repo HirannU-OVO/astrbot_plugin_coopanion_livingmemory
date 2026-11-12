@@ -1,0 +1,298 @@
+{
+  "schema_version": "coopanion.memory-bridge.v1",
+  "tools_schema_version": "coopanion.livingmemory.tools.v1",
+  "allowed_fields": [
+    "persona_id",
+    "session_id",
+    "user_id",
+    "query",
+    "content",
+    "limit",
+    "topics",
+    "importance",
+    "reason",
+    "key_facts",
+    "sentiment",
+    "memory_id",
+    "memory_ids",
+    "cursor",
+    "include_source",
+    "target",
+    "start_time",
+    "end_time"
+  ],
+  "tools": {
+    "mem_search": {
+      "name": "mem_search",
+      "endpoint": "/api/memory/search",
+      "http_method": "POST",
+      "capability": "search",
+      "mode": "direct",
+      "permission": "member",
+      "tags": ["read"],
+      "description": "检索 LivingMemory 长期记忆库与知识图谱。支持多路混合语义召回、实体关系关联以及对话事实匹配。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "检索关键词或查询问题"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "返回条数，默认 5 条",
+            "default": 5,
+            "minimum": 1,
+            "maximum": 20
+          },
+          "session_id": {
+            "type": "string",
+            "description": "可选：指定会话作用域"
+          },
+          "persona_id": {
+            "type": "string",
+            "description": "可选：指定人格作用域"
+          }
+        },
+        "required": ["query"]
+      }
+    },
+    "mem_record": {
+      "name": "mem_record",
+      "endpoint": "/api/memory/add",
+      "http_method": "POST",
+      "capability": "memory",
+      "mode": "direct",
+      "permission": "member",
+      "tags": ["write"],
+      "description": "向 LivingMemory 显式沉淀并记录重要事实、偏好、事件或人际关系（轻量直写，自动建图）。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "要记录的记忆事实、重要事件或设定内容"
+          },
+          "importance": {
+            "type": "number",
+            "description": "重要性程度，0.0 至 1.0 之间，默认 0.6",
+            "default": 0.6,
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "topics": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "可选：这条记忆的主题词（1~5 个）"
+          },
+          "session_id": {
+            "type": "string",
+            "description": "可选：指定会话作用域"
+          },
+          "persona_id": {
+            "type": "string",
+            "description": "可选：指定人格作用域"
+          }
+        },
+        "required": ["content"]
+      }
+    },
+    "mem_memorize": {
+      "name": "mem_memorize",
+      "endpoint": "/api/memory/memorize",
+      "http_method": "POST",
+      "capability": "memorize",
+      "mode": "processed",
+      "permission": "member",
+      "tags": ["write"],
+      "description": "结构化沉淀深度长期记忆。当用户明确要求记住某事，或出现长期偏好、约定、关键事实时使用。经过记忆引擎深度处理器分析。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "简明清晰的长期记忆陈述或事实，供记忆引擎深度处理器分析"
+          },
+          "topics": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "可选：标签主题词列表，最多 5 个",
+            "default": []
+          },
+          "key_facts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "可选：支撑该记忆的关键事实点，最多 5 个",
+            "default": []
+          },
+          "sentiment": {
+            "type": "string",
+            "description": "情感倾向：positive（积极）、neutral（中性）或 negative（消极）",
+            "enum": ["positive", "neutral", "negative"],
+            "default": "neutral"
+          },
+          "importance": {
+            "type": "number",
+            "description": "重要性程度，0.0 至 1.0 之间，默认 0.7",
+            "default": 0.7,
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "reason": {
+            "type": "string",
+            "description": "可选：需要记住这条信息的简要理由",
+            "default": ""
+          },
+          "session_id": {
+            "type": "string",
+            "description": "可选：指定会话作用域"
+          },
+          "persona_id": {
+            "type": "string",
+            "description": "可选：指定人格作用域"
+          }
+        },
+        "required": ["content"]
+      }
+    },
+    "mem_recall": {
+      "name": "mem_recall",
+      "endpoint": "/api/memory/recall",
+      "http_method": "POST",
+      "capability": "recall",
+      "mode": "agentic",
+      "permission": "member",
+      "tags": ["read"],
+      "description": "精准召回长期记忆。当当前上下文不足或需要回忆历史偏好、约定时，使用简练专注的关键词检索。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "简练专注的回忆关键词"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "最大召回条数，默认 5",
+            "default": 5,
+            "minimum": 1,
+            "maximum": 20
+          },
+          "include_source": {
+            "type": "boolean",
+            "description": "是否返回保留的原文消息证据，默认 false",
+            "default": false
+          },
+          "target": {
+            "type": "string",
+            "description": "召回目标范围：conversation（会话整体）或 current_speaker（当前说话人）",
+            "enum": ["conversation", "current_speaker"],
+            "default": "conversation"
+          },
+          "start_time": {
+            "type": "number",
+            "description": "可选：检索时间范围起始时间戳"
+          },
+          "end_time": {
+            "type": "number",
+            "description": "可选：检索时间范围结束时间戳"
+          },
+          "session_id": {
+            "type": "string",
+            "description": "可选：指定会话作用域"
+          },
+          "persona_id": {
+            "type": "string",
+            "description": "可选：指定人格作用域"
+          }
+        },
+        "required": ["query"]
+      }
+    },
+    "mem_evidence": {
+      "name": "mem_evidence",
+      "endpoint": "/api/memory/evidence",
+      "http_method": "POST",
+      "capability": "evidence",
+      "mode": "reader",
+      "permission": "member",
+      "tags": ["read"],
+      "description": "按记忆编号 (memory_id) 深读记忆证据与有效事实。支持 cursor 分页续读。仅在 Beta 回忆特性开启时可用。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "memory_id": {
+            "type": "integer",
+            "description": "由 recall/search 返回的记忆整型 ID"
+          },
+          "include_source": {
+            "type": "boolean",
+            "description": "是否返回保留的原文消息证据，默认 false",
+            "default": false
+          },
+          "cursor": {
+            "type": "string",
+            "description": "分页续读游标，传入上一页的 next_cursor",
+            "default": ""
+          }
+        },
+        "required": ["memory_id"]
+      }
+    },
+    "mem_forget": {
+      "name": "mem_forget",
+      "endpoint": "/api/memory/forget",
+      "http_method": "POST",
+      "capability": "forget",
+      "mode": "archive",
+      "permission": "admin",
+      "tags": ["write"],
+      "description": "归档并软删除过时、错误或敏感的长期记忆。仅限管理员权限，且仅支持软删除（归档），数据库中仍可由管理员恢复。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "memory_ids": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "description": "要软删除/归档的记忆整型 ID 列表，不可猜测 ID"
+          },
+          "reason": {
+            "type": "string",
+            "description": "归档该记忆的审计原因",
+            "default": ""
+          }
+        },
+        "required": ["memory_ids"]
+      }
+    },
+    "mem_status": {
+      "name": "mem_status",
+      "endpoint": "/api/health",
+      "http_method": "GET",
+      "capability": "status",
+      "mode": "direct",
+      "permission": "member",
+      "tags": ["read"],
+      "description": "自检记忆桥接服务与上游记忆库的连通性、各工具可用性及运行状态。",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {}
+      }
+    }
+  }
+}
