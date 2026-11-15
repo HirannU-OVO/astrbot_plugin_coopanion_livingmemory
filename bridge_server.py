@@ -60,7 +60,32 @@ KNOWN_PLATFORM_NAMES = frozenset(
 )
 
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
+
+# ---- 多段检索（/api/memory/search 的可选 queries） ----
+# 仅在调用方显式传 queries 时启用；不传时走的仍是原来的单段路径，行为一字不变。
+_SEGMENT_SPLIT_RE = re.compile(r"[，。；！？,;!?\r\n]+")
+_SEGMENT_MAX = 4
+_SEGMENT_MIN_CHARS = 2
+_SEGMENT_DEADLINE_SEC = 2.5
+_SEGMENT_CACHE_TTL = 60.0
+_RRF_K = 60
+# 段权重：实测发现给首段更高权重会让「无锚点口语段」压过「关键信息段」，
+# 把真正的命中（388）挤出 top3，所以这里取等权（RRF 原始定义即无权重融合）。
+# 保留两个常量是为了以后按需调整，改这里即可。
+_SEGMENT_WEIGHT_FIRST = 1.0
+_SEGMENT_WEIGHT_REST = 1.0
+
+# ---- 关键词子串路：只调上游公开方法 list_memories_page(keyword=...) ----
+_KEYWORD_MAX = 6            # 单次最多提取几个关键词
+_KEYWORD_BUDGET_SEC = 0.6   # 关键词路总预算，超时只用已返回部分
+_KEYWORD_RRF_WEIGHT = 0.9   # 融合权重：略低于主路 1.0（子串精度高但覆盖窄）
+_KEYWORD_CJK_MIN = 2        # 中文段最短 2 字
+_KEYWORD_CJK_MAX = 6        # 中文段最长 6 字；更长的整段跳过（避免噪声）
+_ASCII_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.\-/]{2,}")
+_CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]{2,}")
+_NUM_ID_RE = re.compile(r"\d{4,}")
+_KEYWORD_SEP_RE = re.compile(r"[-_./]+")
 
 
 class LivingMemoryBridgeServer:
@@ -110,6 +135,10 @@ class LivingMemoryBridgeServer:
         self._mode_state: dict[str, Any] = {}
         self._persona_filtering_warning = ""
         self._persona_filtering_logged = False
+        # 多段检索结果缓存：key -> (monotonic_ts, payload)
+        self._segment_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        # 关键词子串路开关（默认开；关掉后行为与加此路之前完全一致）
+        self.keyword_boost_enabled = bool(config.get("recall_keyword_boost", True))
         # 参与者显示名/别名：优先级 user_map > 旧文本 > 内部 dict 配置。
         internal_names = {
             str(k).strip(): str(v).strip()
@@ -221,7 +250,7 @@ class LivingMemoryBridgeServer:
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
 
-        # 单实例身份与生命周期状态机 (D-03, D-04, D-05)
+        # 单实例身份与生命周期状态机
         self.bridge_instance_id = (
             f"bridge_{int(time.time() * 1000)}_{os.getpid()}_{uuid.uuid4().hex[:6]}"
         )
@@ -1570,7 +1599,7 @@ class LivingMemoryBridgeServer:
                 stats_data = {"error": str(e)}
 
         capability = self.upstream.capability_summary()
-        # 动态判定当前实例状态 (D-04)
+        # 动态判定当前实例状态
         if self.state not in ("port_conflict", "failed", "external_owner"):
             if connected:
                 self.state = "ready"
@@ -1637,7 +1666,7 @@ class LivingMemoryBridgeServer:
         )
 
     async def handle_manifest(self, request: web.Request) -> web.Response:
-        """GET /api/tools/manifest - 动态暴露工具面定义与可用性目录 (A-02)"""
+        """GET /api/tools/manifest - 动态暴露工具面定义与可用性目录"""
         self.upstream.refresh()
         tools_list = []
         catalog_list = []
@@ -1663,7 +1692,7 @@ class LivingMemoryBridgeServer:
             if avail:
                 tools_list.append(tool_entry)
 
-        # 签名与 revision (LM-E2E-06 热更新检测)
+        # 签名与 revision (热更新检测)
         raw_rev = f"{SCHEMA_VERSION}_{VERSION}_{self.upstream.upstream_version()}_" + "_".join(t["name"] for t in tools_list)
         rev = hashlib.sha256(raw_rev.encode()).hexdigest()[:12]
 
@@ -1681,7 +1710,7 @@ class LivingMemoryBridgeServer:
         )
 
     async def handle_search(self, request: web.Request) -> web.Response:
-        """POST /api/memory/search - 多路混合语义与图谱检索 (A-01, mem_search)"""
+        """POST /api/memory/search - 多路混合语义与图谱检索 (mem_search)"""
         await self._ensure_auto()
         blocked = self._capability_block_response("search", "检索")
         if blocked is not None:
@@ -1700,7 +1729,7 @@ class LivingMemoryBridgeServer:
                 {"ok": False, "code": "invalid_json", "error": "无效的 JSON 请求体"}, status=400
             )
 
-        # 严格契约参数校验 (D-01, LM-E2E-18, LM-E2E-19)
+        # 严格契约参数校验
         valid, err = validate_tool_params("mem_search", data)
         if not valid and err:
             return web.json_response(err, status=422)
@@ -1710,9 +1739,35 @@ class LivingMemoryBridgeServer:
         session_id = data.get("session_id") or self.default_session_id
         persona_id = self._effective_persona(data.get("persona_id"))
 
+        # 可选多段检索：只有调用方显式传 queries 且超过 1 段时才走新路径，
+        # 其余情况（含不传 queries）保持原来的单段实现，行为与改前完全一致。
+        segments = self._normalize_queries(data.get("queries"))
+        if not query and not segments:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "code": "missing_field",
+                    "error": "query 与 queries 至少提供一个",
+                },
+                status=422,
+            )
+
+        if len(segments) > 1:
+            try:
+                payload = await self._search_multi_segment(
+                    engine, segments, limit, session_id, persona_id
+                )
+                return web.json_response(payload)
+            except Exception as e:
+                logger.error(f"[LivingMemoryBridge] 多段检索失败: {e}", exc_info=True)
+                return web.json_response(
+                    {"ok": False, "code": "internal_error", "error": str(e)}, status=500
+                )
+
+        attempt_query = query or (segments[0] if segments else "")
         try:
             results = await self._search_with_read_scope(
-                engine, query, limit, session_id, persona_id
+                engine, attempt_query, limit, session_id, persona_id
             )
 
             memories = []
@@ -1726,10 +1781,20 @@ class LivingMemoryBridgeServer:
                     }
                 )
 
+            # 关键词子串路：只补「向量/BM25 候选里根本没有」的精确命中
+            if self.keyword_boost_enabled:
+                keywords = self._extract_keywords(attempt_query)
+                if keywords:
+                    keyword_hits = await self._search_by_keywords(
+                        engine, keywords, limit, session_id, persona_id
+                    )
+                    if keyword_hits:
+                        memories = self._fuse_memories(memories, keyword_hits, limit)
+
             return web.json_response(
                 {
                     "ok": True,
-                    "query": query,
+                    "query": attempt_query,
                     "count": len(memories),
                     "memories": memories,
                 }
@@ -1737,6 +1802,337 @@ class LivingMemoryBridgeServer:
         except Exception as e:
             logger.error(f"[LivingMemoryBridge] 检索失败: {e}", exc_info=True)
             return web.json_response({"ok": False, "code": "internal_error", "error": str(e)}, status=500)
+
+    # ------------------------------------------------------------------
+    # 多段检索（可选能力，仅在 queries 显式传入且 >=2 段时启用）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_queries(raw: Any) -> list[str]:
+        """把 queries 规整成去重、非空、长度达标的段列表（最多 4 段）。
+
+        只接受字符串数组；任何非法元素直接忽略。返回空列表表示未提供多段。
+        """
+        if not isinstance(raw, list):
+            return []
+        out: list[str] = []
+        for item in raw:
+            if not isinstance(item, str):
+                continue
+            text = item.strip()
+            if len(text) < _SEGMENT_MIN_CHARS:
+                continue
+            if text in out:
+                continue
+            out.append(text)
+            if len(out) >= _SEGMENT_MAX:
+                break
+        return out
+
+    @staticmethod
+    def _split_query_segments(query: str) -> list[str]:
+        """按中英文标点与换行切分长 query；供调用方未传 queries 时的自切使用。"""
+        parts = [p.strip() for p in _SEGMENT_SPLIT_RE.split(str(query or ""))]
+        out: list[str] = []
+        for part in parts:
+            if len(part) < _SEGMENT_MIN_CHARS:
+                continue
+            if part in out:
+                continue
+            out.append(part)
+            if len(out) >= _SEGMENT_MAX:
+                break
+        return out
+
+    # ------------------------------------------------------------------
+    # 关键词子串路：从 query 提关键词 → 上游公开方法 list_memories_page
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _keyword_variants(token: str) -> list[str]:
+        """D+ 第 1 项：复合标识给双形态 + 小写变体。
+
+        - 原串（最高优先）
+        - 按 `- _ . /` 拆出的子 token（取前两个，长度 ≥2）
+        - 小写变体
+        纯字符串处理，不引入任何新依赖。
+        """
+        out: list[str] = []
+
+        def push(value: str) -> None:
+            value = value.strip()
+            if len(value) >= 2 and value not in out:
+                out.append(value)
+
+        push(token)
+        parts = [p for p in _KEYWORD_SEP_RE.split(token) if len(p) >= 2]
+        if len(parts) >= 2:
+            for part in parts[:2]:
+                push(part)
+        push(token.lower())
+        return out
+
+    def _extract_keywords(self, query: str) -> list[str]:
+        """从 query 抽取适合做子串匹配的片段。
+
+        规则（与调研文档 §四 一致）：
+        1. 英文/数字复合标识（≥3 字符，允许 `- _ . /`）；
+        2. 中文连续段，长度 2~6 直接取；更长的跳过（整句 LIKE 命中率低且噪声大）；
+        3. 4 位以上纯数字（记忆 ID / 账号）。
+        """
+        text = str(query or "")
+        out: list[str] = []
+
+        def push(value: str) -> None:
+            value = value.strip()
+            if len(value) >= 2 and value not in out:
+                out.append(value)
+
+        for match in _ASCII_TOKEN_RE.finditer(text):
+            for variant in self._keyword_variants(match.group(0)):
+                push(variant)
+                if len(out) >= _KEYWORD_MAX:
+                    return out
+
+        for match in _CJK_RUN_RE.finditer(text):
+            run = match.group(0)
+            if _KEYWORD_CJK_MIN <= len(run) <= _KEYWORD_CJK_MAX:
+                push(run)
+            if len(out) >= _KEYWORD_MAX:
+                return out
+
+        for match in _NUM_ID_RE.finditer(text):
+            push(match.group(0))
+            if len(out) >= _KEYWORD_MAX:
+                return out
+
+        return out[:_KEYWORD_MAX]
+
+    async def _search_by_keywords(
+        self,
+        engine: Any,
+        keywords: list[str],
+        limit: int,
+        session_id: str,
+        persona_id: str,
+    ) -> dict[int, dict[str, Any]]:
+        """并行调用上游 list_memories_page(keyword=...)，返回 {documents.id: 命中信息}。
+
+        只使用上游公开方法；任何单关键词失败都只跳过它。
+        """
+        if not keywords or not hasattr(engine, "list_memories_page"):
+            return {}
+
+        tasks: dict[asyncio.Task, str] = {}
+        for keyword in keywords:
+            try:
+                coro = engine.list_memories_page(
+                    session_id=session_id or None,
+                    keyword=keyword,
+                    status="active",
+                    page=1,
+                    page_size=max(limit * 2, 10),
+                )
+            except TypeError:
+                # 老版本签名不接受某些参数：退化为最少参数调用
+                coro = engine.list_memories_page(keyword=keyword, page=1, page_size=max(limit * 2, 10))
+            tasks[asyncio.create_task(coro)] = keyword
+
+        done, pending = await asyncio.wait(tasks.keys(), timeout=_KEYWORD_BUDGET_SEC)
+        for task in pending:
+            task.cancel()
+
+        hits: dict[int, dict[str, Any]] = {}
+        for task in done:
+            keyword = tasks[task]
+            try:
+                page_payload = task.result() or {}
+            except Exception as exc:  # 单个关键词失败不影响其它
+                logger.debug("[LivingMemoryBridge] 关键词 %r 检索失败: %s", keyword, exc)
+                continue
+            items = page_payload.get("items") or []
+            for position, item in enumerate(items):
+                doc_id = item.get("id")
+                if doc_id is None:
+                    continue
+                entry = hits.setdefault(
+                    doc_id, {"item": item, "keywords": [], "score": 0.0}
+                )
+                if keyword not in entry["keywords"]:
+                    entry["keywords"].append(keyword)
+                    entry["score"] += _KEYWORD_RRF_WEIGHT / (_RRF_K + position + 1)
+        return hits
+
+    @staticmethod
+    def _fuse_memories(
+        main_memories: list[dict[str, Any]],
+        keyword_hits: dict[int, dict[str, Any]],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """主路与关键词路 RRF 融合。
+
+        主路按名次折算 RRF 分（与关键词路同量级），关键词路每个命中词累加；
+        同时被两路命中的文档自然分更高。结果标 `from_keywords`。
+        """
+        fused: dict[int, dict[str, Any]] = {}
+
+        for rank, memory in enumerate(main_memories):
+            doc_id = memory.get("id")
+            if doc_id is None:
+                continue
+            fused[doc_id] = {
+                "id": doc_id,
+                "content": memory.get("content") or "",
+                "score": 1.0 / (_RRF_K + rank + 1),
+                "metadata": dict(memory.get("metadata") or {}),
+            }
+
+        for doc_id, hit in keyword_hits.items():
+            item = hit.get("item") or {}
+            raw_metadata = item.get("metadata")
+            if isinstance(raw_metadata, str):
+                try:
+                    raw_metadata = json.loads(raw_metadata)
+                except Exception:
+                    raw_metadata = {}
+            metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+            metadata["from_keywords"] = list(hit.get("keywords") or [])
+
+            existing = fused.get(doc_id)
+            if existing is not None:
+                existing["score"] += float(hit.get("score") or 0.0)
+                existing["metadata"]["from_keywords"] = metadata["from_keywords"]
+            else:
+                fused[doc_id] = {
+                    "id": doc_id,
+                    "content": item.get("text") or "",
+                    "score": float(hit.get("score") or 0.0),
+                    "metadata": metadata,
+                }
+
+        ordered = sorted(fused.values(), key=lambda entry: entry["score"], reverse=True)
+        return [
+            {
+                "id": entry["id"],
+                "content": entry["content"],
+                "score": round(float(entry["score"]), 6),
+                "metadata": entry["metadata"],
+            }
+            for entry in ordered[:limit]
+        ]
+
+    async def _search_multi_segment(
+        self,
+        engine: Any,
+        segments: list[str],
+        limit: int,
+        session_id: str,
+        persona_id: str,
+    ) -> dict[str, Any]:
+        """逐段并行检索，min-max 归一分后按 RRF 融合；整批硬超时 2.5s。
+
+        超时后已到达的段照常参与融合并标 `partial: true`；完整结果缓存 60s。
+        """
+        cache_key = f"{'|'.join(segments)}|{persona_id}|{limit}"
+        now = time.monotonic()
+        cached = self._segment_cache.get(cache_key)
+        if cached is not None and now - cached[0] < _SEGMENT_CACHE_TTL:
+            return dict(cached[1])
+
+        tasks: dict[asyncio.Task, int] = {}
+        for index, segment in enumerate(segments):
+            task = asyncio.create_task(
+                self._search_with_read_scope(
+                    engine, segment, limit, session_id, persona_id
+                )
+            )
+            tasks[task] = index
+
+        done, pending = await asyncio.wait(
+            tasks.keys(), timeout=_SEGMENT_DEADLINE_SEC
+        )
+        partial = bool(pending)
+        for task in pending:
+            task.cancel()
+
+        by_segment: dict[int, list[Any]] = {}
+        for task in done:
+            index = tasks[task]
+            try:
+                by_segment[index] = task.result() or []
+            except Exception as exc:  # 单段失败不影响其它段
+                logger.warning(f"[LivingMemoryBridge] 第 {index + 1} 段检索失败: {exc}")
+                by_segment[index] = []
+
+        merged: dict[Any, dict[str, Any]] = {}
+        for index in sorted(by_segment):
+            rows = by_segment[index]
+            if not rows:
+                continue
+            weight = _SEGMENT_WEIGHT_FIRST if index == 0 else _SEGMENT_WEIGHT_REST  # 当前等权
+            scores = [float(getattr(r, "final_score", 0.0) or 0.0) for r in rows]
+            low, high = min(scores), max(scores)
+            span = (high - low) or 1.0
+            normalized = [(s - low) / span for s in scores]
+            ranked = sorted(
+                range(len(rows)), key=lambda i: normalized[i], reverse=True
+            )
+            for rank, row_index in enumerate(ranked):
+                row = rows[row_index]
+                key = getattr(row, "doc_id", None)
+                if key is None:
+                    key = id(row)
+                entry = merged.setdefault(
+                    key, {"row": row, "score": 0.0, "segments": []}
+                )
+                entry["score"] += weight / (_RRF_K + rank + 1)
+                entry["segments"].append(index + 1)
+
+        ordered = sorted(
+            merged.values(), key=lambda e: e["score"], reverse=True
+        )[:limit]
+
+        memories: list[dict[str, Any]] = []
+        for entry in ordered:
+            row = entry["row"]
+            metadata = dict(getattr(row, "metadata", {}) or {})
+            metadata["from_segments"] = entry["segments"]
+            memories.append(
+                {
+                    "id": getattr(row, "doc_id", None),
+                    "content": getattr(row, "content", ""),
+                    "score": round(entry["score"], 6),
+                    "metadata": metadata,
+                }
+            )
+
+        # 关键词子串路：与多段结果再融合一次（扩展端实际走的就是这条路径）
+        if self.keyword_boost_enabled:
+            keywords: list[str] = []
+            for segment in segments:
+                for keyword in self._extract_keywords(segment):
+                    if keyword not in keywords:
+                        keywords.append(keyword)
+                if len(keywords) >= _KEYWORD_MAX:
+                    break
+            keywords = keywords[:_KEYWORD_MAX]
+            if keywords:
+                keyword_hits = await self._search_by_keywords(
+                    engine, keywords, limit, session_id, persona_id
+                )
+                if keyword_hits:
+                    memories = self._fuse_memories(memories, keyword_hits, limit)
+
+        payload: dict[str, Any] = {
+            "ok": True,
+            "query": " | ".join(segments),
+            "count": len(memories),
+            "partial": partial,
+            "memories": memories,
+        }
+        if not partial:
+            self._segment_cache[cache_key] = (now, dict(payload))
+        return payload
 
     async def handle_add(self, request: web.Request) -> web.Response:
         """POST /api/memory/add - 添加记忆记录 (轻量直写，mem_record)"""
@@ -1758,7 +2154,7 @@ class LivingMemoryBridgeServer:
                 {"ok": False, "code": "invalid_json", "error": "无效的 JSON 请求体"}, status=400
             )
 
-        # 严格契约校验 (D-01, LM-E2E-20)
+        # 严格契约校验
         valid, err = validate_tool_params("mem_record", data)
         if not valid and err:
             return web.json_response(err, status=422)
@@ -1780,7 +2176,7 @@ class LivingMemoryBridgeServer:
             metadata["source"] = "coopanion_pet"
         if "adapter_id" not in metadata:
             metadata["adapter_id"] = self.default_adapter_id
-        # 区分两条写入通道 (2.2 & LM-E2E-08)
+        # 区分两条写入通道 (2.2)
         metadata["memory_origin"] = "pet_mem_record"
         metadata = self._enrich_metadata(
             content,
@@ -1807,7 +2203,7 @@ class LivingMemoryBridgeServer:
             return web.json_response({"ok": False, "code": "internal_error", "error": str(e)}, status=500)
 
     async def handle_memorize(self, request: web.Request) -> web.Response:
-        """POST /api/memory/memorize - 深度结构化记忆沉淀 (A-03, mem_memorize)"""
+        """POST /api/memory/memorize - 深度结构化记忆沉淀 (mem_memorize)"""
         await self._ensure_auto()
         avail, reason = self.upstream.is_memorize_enabled()
         if not avail:
@@ -1911,7 +2307,7 @@ class LivingMemoryBridgeServer:
             )
 
     async def handle_recall(self, request: web.Request) -> web.Response:
-        """POST /api/memory/recall - 专注精准召回 (A-04, mem_recall)"""
+        """POST /api/memory/recall - 专注精准召回 (mem_recall)"""
         await self._ensure_auto()
         avail, reason = self.upstream.is_recall_enabled()
         if not avail:
@@ -2011,7 +2407,7 @@ class LivingMemoryBridgeServer:
             )
 
     async def handle_evidence(self, request: web.Request) -> web.Response:
-        """POST /api/memory/evidence - 按 memory_id 深读记忆事实与原文 (A-05, mem_evidence)"""
+        """POST /api/memory/evidence - 按 memory_id 深读记忆事实与原文 (mem_evidence)"""
         await self._ensure_auto()
         avail, reason = self.upstream.is_evidence_enabled()
         if not avail:
@@ -2089,7 +2485,7 @@ class LivingMemoryBridgeServer:
             )
 
     async def handle_forget(self, request: web.Request) -> web.Response:
-        """POST /api/memory/forget - 记忆软删除/归档 (A-06, mem_forget)"""
+        """POST /api/memory/forget - 记忆软删除/归档 (mem_forget)"""
         await self._ensure_auto()
         avail, reason = self.upstream.is_forget_enabled()
         if not avail:
@@ -2151,7 +2547,7 @@ class LivingMemoryBridgeServer:
                 status=400,
             )
 
-        # 权限校验：仅管理员可调用 (LM-E2E-11)
+        # 权限校验：仅管理员可调用
         # 配置缺失时不放行，避免未设置 admins_id 时任何人都能归档记忆。
         requester_id = str(data.get("user_id") or self._session_user_id() or "")
         admins: list[str] = []
@@ -2477,7 +2873,7 @@ class LivingMemoryBridgeServer:
         return web.json_response(payload)
 
     async def start(self):
-        """启动 HTTP 桥服务，实现单实例锁与状态机 (D-04, D-05)"""
+        """启动 HTTP 桥服务，实现单实例锁与状态机"""
         self.state = "starting"
         # 1. 探测端口是否已被活实例占用
         status, data = await self._probe_port()

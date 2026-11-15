@@ -29,7 +29,9 @@
       "capability": "search",
       "mode": "direct",
       "permission": "member",
-      "tags": ["read"],
+      "tags": [
+        "read"
+      ],
       "description": "检索 LivingMemory 长期记忆库与知识图谱。支持多路混合语义召回、实体关系关联以及对话事实匹配。",
       "parameters": {
         "type": "object",
@@ -38,6 +40,14 @@
           "query": {
             "type": "string",
             "description": "检索关键词或查询问题"
+          },
+          "queries": {
+            "type": "array",
+            "description": "可选：多段检索词（最多 4 段）。不传时行为与单段 query 完全一致；传了则由桥端逐段检索并按 RRF 融合。",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 4
           },
           "limit": {
             "type": "integer",
@@ -55,7 +65,7 @@
             "description": "可选：指定人格作用域"
           }
         },
-        "required": ["query"]
+        "required": []
       }
     },
     "mem_record": {
@@ -65,7 +75,9 @@
       "capability": "memory",
       "mode": "direct",
       "permission": "member",
-      "tags": ["write"],
+      "tags": [
+        "write"
+      ],
       "description": "向 LivingMemory 显式沉淀并记录重要事实、偏好、事件或人际关系（轻量直写，自动建图）。",
       "parameters": {
         "type": "object",
@@ -98,7 +110,9 @@
             "description": "可选：指定人格作用域"
           }
         },
-        "required": ["content"]
+        "required": [
+          "content"
+        ]
       }
     },
     "mem_memorize": {
@@ -108,7 +122,9 @@
       "capability": "memorize",
       "mode": "processed",
       "permission": "member",
-      "tags": ["write"],
+      "tags": [
+        "write"
+      ],
       "description": "结构化沉淀深度长期记忆。当用户明确要求记住某事，或出现长期偏好、约定、关键事实时使用。经过记忆引擎深度处理器分析。",
       "parameters": {
         "type": "object",
@@ -137,7 +153,11 @@
           "sentiment": {
             "type": "string",
             "description": "情感倾向：positive（积极）、neutral（中性）或 negative（消极）",
-            "enum": ["positive", "neutral", "negative"],
+            "enum": [
+              "positive",
+              "neutral",
+              "negative"
+            ],
             "default": "neutral"
           },
           "importance": {
@@ -161,7 +181,9 @@
             "description": "可选：指定人格作用域"
           }
         },
-        "required": ["content"]
+        "required": [
+          "content"
+        ]
       }
     },
     "mem_recall": {
@@ -171,7 +193,9 @@
       "capability": "recall",
       "mode": "agentic",
       "permission": "member",
-      "tags": ["read"],
+      "tags": [
+        "read"
+      ],
       "description": "精准召回长期记忆。当当前上下文不足或需要回忆历史偏好、约定时，使用简练专注的关键词检索。",
       "parameters": {
         "type": "object",
@@ -196,7 +220,10 @@
           "target": {
             "type": "string",
             "description": "召回目标范围：conversation（会话整体）或 current_speaker（当前说话人）",
-            "enum": ["conversation", "current_speaker"],
+            "enum": [
+              "conversation",
+              "current_speaker"
+            ],
             "default": "conversation"
           },
           "start_time": {
@@ -216,7 +243,9 @@
             "description": "可选：指定人格作用域"
           }
         },
-        "required": ["query"]
+        "required": [
+          "query"
+        ]
       }
     },
     "mem_evidence": {
@@ -226,7 +255,9 @@
       "capability": "evidence",
       "mode": "reader",
       "permission": "member",
-      "tags": ["read"],
+      "tags": [
+        "read"
+      ],
       "description": "按记忆编号 (memory_id) 深读记忆证据与有效事实。支持 cursor 分页续读。仅在 Beta 回忆特性开启时可用。",
       "parameters": {
         "type": "object",
@@ -247,7 +278,9 @@
             "default": ""
           }
         },
-        "required": ["memory_id"]
+        "required": [
+          "memory_id"
+        ]
       }
     },
     "mem_forget": {
@@ -257,7 +290,9 @@
       "capability": "forget",
       "mode": "archive",
       "permission": "admin",
-      "tags": ["write"],
+      "tags": [
+        "write"
+      ],
       "description": "归档并软删除过时、错误或敏感的长期记忆。仅限管理员权限，且仅支持软删除（归档），数据库中仍可由管理员恢复。",
       "parameters": {
         "type": "object",
@@ -276,7 +311,9 @@
             "default": ""
           }
         },
-        "required": ["memory_ids"]
+        "required": [
+          "memory_ids"
+        ]
       }
     },
     "mem_status": {
@@ -286,7 +323,9 @@
       "capability": "status",
       "mode": "direct",
       "permission": "member",
-      "tags": ["read"],
+      "tags": [
+        "read"
+      ],
       "description": "自检记忆桥接服务与上游记忆库的连通性、各工具可用性及运行状态。",
       "parameters": {
         "type": "object",

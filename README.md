@@ -104,7 +104,7 @@ git clone https://github.com/HirannU-OVO/astrbot_plugin_coopanion_livingmemory.g
 | 接口 | 作用 |
 | :--- | :--- |
 | `GET /api/health` | 查看桥接服务与记忆插件是否正常 |
-| `POST /api/memory/search` | 检索长期记忆（语义 + 关键词 + 知识图谱） |
+| `POST /api/memory/search` | 检索长期记忆（语义 + 关键词 + 知识图谱；可选 `queries` 多段融合） |
 | `POST /api/memory/add` | 写入一条记忆 |
 | `POST /api/memory/batch_add` | 批量写入记忆（迁移/导入用） |
 | `POST /api/memory/chat` | 接收桌宠对话，交给记忆插件做后台总结 |
@@ -113,9 +113,23 @@ git clone https://github.com/HirannU-OVO/astrbot_plugin_coopanion_livingmemory.g
 | `POST /api/memory/memorize` | 深度结构化沉淀（提炼关键事实与情感倾向） |
 | `POST /api/memory/recall` | 精准召回（可按说话人或时间范围） |
 | `POST /api/memory/evidence` | 深读某条记忆的结构化事实与原文证据 |
-| `POST /api/memory/forget` | 归档并软删除记忆（仅管理员，需配置 `admins_id`） |
+| `POST /api/memory/forget` | 归档并软删除记忆（仅管理员，鉴权用 AstrBot 全局配置里的 `admins_id`） |
 
 如果配置了「校验 token」，所有 `/api/*` 请求都需要带上 `Authorization: Bearer <你的 token>`。
+
+### 多段检索（`queries`）
+
+`/api/memory/search` 除了单个 `query`，还可以传 `queries`（字符串数组，最多 4 段）。桥端逐段检索、再用 RRF 把各路结果融合成一份，适合一次问几件事、或把长问题拆成几个关键词。
+
+不传 `queries` 时行为与单段完全一致，原有调用方不受影响。**这一项需要桥端 0.2.3 及以上**：旧版会忽略这个字段、按空查询返回无关结果。
+
+### 关键词子串增强（`recall_keyword_boost`）
+
+默认开启。开启后除向量 / BM25 之外会多走一条「关键词子串」检索：从查询里抽出英文标识、中文短词、数字 ID，直接在上游记忆正文里做子串匹配，再按 RRF 并入结果。专有名词、工具名、型号、文件名这类稀有词靠它才能稳定召回。关掉后行为与没有这条检索时完全一致。面板里叫「关键词子串增强」。
+
+### `mem_forget` 的管理员鉴权
+
+软删除只对管理员开放，判定用的是 **AstrBot 全局配置里的 `admins_id`**，不是本插件的面板项：在 AstrBot 面板的配置页填，或直接编辑 `data/cmd_config.json` 里的 `admins_id`（字符串数组，写 QQ 号）。这一项为空时**一律不放行**，避免没配管理员就能归档记忆。
 
 ---
 
@@ -138,6 +152,7 @@ git clone https://github.com/HirannU-OVO/astrbot_plugin_coopanion_livingmemory.g
 | 桌宠单独记的人格 | `pet_persona_id` | 字符串 | 自动检测 | 独立记录时的人格，留空自动补充「-桌宠」 |
 | 记忆存到哪个会话（高级） | `default_session_id` | 字符串 | 自动检测 | 会话标识，留空自动挑记忆最多的历史会话 |
 | 消息从哪个平台进来（高级） | `default_adapter_id` | 字符串 | 无 | 高级项，多适配器互通时才填，一般留空 |
+| 关键词子串增强 | `recall_keyword_boost` | 布尔 | `true` | 检索时额外走一条关键词子串，专有名词、工具名、型号、文件名这类稀有词靠它稳定召回；关掉后与没有这条时一致 |
 
 另有 2 个隐藏项（旧映射两项）平时看不到，迁移场景才会出现，正常不用管。
 

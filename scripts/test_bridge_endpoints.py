@@ -83,21 +83,21 @@ class FakeContext:
 
 
 async def run_tests():
-    print("=== 1. 契约参数校验 (LM-E2E-18 ~ 21) ===")
-    # LM-E2E-18: 未知字段 target_user_id
+    print("=== 1. 契约参数校验 (~ 21) ===")
+    # 未知字段 target_user_id
     ok, err = validate_tool_params("mem_search", {"query": "hello", "target_user_id": "123"})
     assert not ok and err["code"] == "unknown_field" and err["field"] == "target_user_id", err
-    print("PASS: LM-E2E-18 未知字段被严格拒绝 (422 unknown_field)")
+    print("PASS: 未知字段被严格拒绝 (422 unknown_field)")
 
-    # LM-E2E-19: 缺 query
+    # 缺 query
     ok, err = validate_tool_params("mem_search", {})
     assert not ok and err["code"] == "missing_field" and err["field"] == "query", err
-    print("PASS: LM-E2E-19 缺失必填字段被拒绝 (422 missing_field)")
+    print("PASS: 缺失必填字段被拒绝 (422 missing_field)")
 
-    # LM-E2E-20: 错误类型 topics 传字符串
+    # 错误类型 topics 传字符串
     ok, err = validate_tool_params("mem_record", {"content": "test", "topics": "not-a-list"})
     assert not ok and err["code"] == "invalid_type" and err["field"] == "topics", err
-    print("PASS: LM-E2E-20 错误类型被拒绝 (422 invalid_type)")
+    print("PASS: 错误类型被拒绝 (422 invalid_type)")
 
     # 有效参数
     ok, err = validate_tool_params("mem_search", {"query": "test query", "limit": 3})
@@ -113,7 +113,7 @@ async def run_tests():
     assert ok and err is None
     print("PASS: 合法参数校验全通过")
 
-    print("\n=== 2. 上游可用性与工具状态判定 (LM-E2E-03, LM-E2E-04) ===")
+    print("\n=== 2. 上游可用性与工具状态判定  ===")
     plugin = FakePlugin()
     adapter = UpstreamLivingMemoryAdapter(FakeContext(plugin))
     adapter._negative_ttl = 0.01
@@ -128,9 +128,9 @@ async def run_tests():
     # Forget 未开
     assert adapter.is_forget_enabled()[0] is False
     assert "agent_tools.enable_forget_tool" in adapter.is_forget_enabled()[1]
-    print("PASS: LM-E2E-03 & 04 工具开启与关闭状态精准识别")
+    print("PASS: & 04 工具开启与关闭状态精准识别")
 
-    print("\n=== 3. Server 初始化与 Manifest 生成 (A-02, LM-E2E-01 ~ 07) ===")
+    print("\n=== 3. Server 初始化与 Manifest 生成 (~ 07) ===")
     server = LivingMemoryBridgeServer(FakeContext(plugin), {"port": 16198, "host": "127.0.0.1"})
     server.upstream = adapter
 
@@ -155,7 +155,7 @@ async def run_tests():
     assert "mem_forget" not in active_names
     print(f"PASS: Manifest 生成正确，可用工具: {active_names} (关闭的工具仅在 catalog)")
 
-    print("\n=== 4. 记忆写入与深度沉淀 (A-03, LM-E2E-08 ~ 09) ===")
+    print("\n=== 4. 记忆写入与深度沉淀 (~ 09) ===")
     class MockJsonRequest:
         def __init__(self, payload):
             self._payload = payload
@@ -189,7 +189,7 @@ async def run_tests():
     assert recall_data["results"][0]["id"] == 1001
     print("PASS: handle_recall 执行成功，返回对应记忆")
 
-    # 测试 handle_forget 在未启用时的明确拒绝 (LM-E2E-14 / LM-E2E-15)
+    # 测试 handle_forget 在未启用时的明确拒绝
     forget_req = MockJsonRequest({"memory_ids": [1001], "reason": "过期"})
     forget_resp = await server.handle_forget(forget_req)
     assert forget_resp.status == 403
@@ -235,7 +235,7 @@ async def run_tests():
     assert json.loads(admin_resp.text)["ok"] is True
     print("PASS: 白名单管理员可正常归档记忆")
 
-    print("\n=== 5. 单实例锁机制 (D-05, LM-E2E-22) ===")
+    print("\n=== 5. 单实例锁机制  ===")
     lock_ok = server._acquire_lock()
     assert lock_ok is True
     lock_file = server._lock_file_path()

@@ -2,6 +2,14 @@
 
 本文件记录「LivingMemory 桌宠直连桥接 (astrbot_plugin_coopanion_livingmemory)」插件的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.3] - 2026-11-15
+
+### 新增
+
+- **关键词子串增强路**：向量与 BM25 之外再加一条检索路。从查询里抽英文复合标识、中文 2~6 字短词、数字 ID（最多 6 个），复合标识按 `- _ . /` 拆子 token 并保留原串、英文附小写变体；调上游公开方法 `list_memories_page(keyword=)` 在记忆正文里做子串匹配，结果按 RRF 并入融合并标 `from_segments`。权重保守取值，关键词路并行、总预算 600ms。专有名词、工具名、型号、文件名这类稀有词靠它才能稳定召回。
+- **新配置项 `recall_keyword_boost`**（bool，默认 `true`）：关掉后行为与未加此功能时完全一致。
+- **`mem_search` 支持多段检索**：新增 `queries` 参数（最多 4 段），`query` 改为可选；传了则逐段检索并按 RRF 融合，不传时与单段完全一致。
+
 ## [0.2.2] - 2026-11-12
 
 ### 新增

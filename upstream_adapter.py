@@ -415,7 +415,7 @@ class UpstreamLivingMemoryAdapter:
         )
 
     # ------------------------------------------------------------------
-    # 工具可用性与启用状态判定 (对齐 A-02 ~ A-07 / LM-E2E-01 ~ LM-E2E-07)
+    # 工具可用性与启用状态判定 (对齐 ~ / ~ )
     # ------------------------------------------------------------------
     def is_search_enabled(self) -> tuple[bool, str]:
         engine_cap = self.capability("engine")
