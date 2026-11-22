@@ -7,7 +7,19 @@
 > - 桌宠侧必须成对安装配套扩展：[cortico-world-astrbot-livingmemory](https://github.com/HirannU-OVO/cortico-world-astrbot-livingmemory)；
 > - 两个插件通过本地 HTTP 接口交互，**必须成对安装运行**。
 
----
+## 先看这里：你的记忆里有没有 AstrBot
+
+第一步，在 AstrBot 的记忆桥设置里选「使用场景」：
+
+- 只有桌宠、没有 AstrBot 参与 → 选「纯桌宠」
+- AstrBot 也参与对话（它自己回 QQ，或桌宠接管了它的对话）→ 选「接入 AstrBot」
+
+第二步，如果上一步选了「接入 AstrBot」，再到桌宠设置里选「桌宠的记忆」：
+
+- 「与 AstrBot 共享」→ 桌宠和 AstrBot 用同一份记忆，能互相召回
+- 「桌宠单独一份」→ 桌宠自己记，AstrBot 看不到
+
+选了「纯桌宠」的话，第二步不用管，那个下拉不起作用。
 
 ## 架构与分工
 
@@ -45,6 +57,10 @@ astrbot_plugin_livingmemory（记忆库 + 知识图谱 + 会话蒸馏）
 ---
 
 ## 安装与快速上手
+
+> **多端一起升级**：本插件、桌宠扩展 `cortico-world-astrbot-livingmemory`、QQ 消息接入扩展 `cortico-world-astrbot` 要一起升级；只升一侧会出现面板项对不上。若同时使用 Cortico 桥，还需要 `astrbot_plugin_cortico_bridge` 1.3.7 或更高。
+>
+> **Cortico 桥安装提示**：AstrBot 插件面板里默认的插件源指向旧版本，装不到 1.3.7；需要手动把插件源改成 GitHub 仓库 https://github.com/as124da1231/astrbot_plugin_cortico_bridge 再安装或更新。
 
 ### 1. 安装前置插件
 
@@ -108,6 +124,10 @@ git clone https://github.com/HirannU-OVO/astrbot_plugin_coopanion_livingmemory.g
 | `POST /api/memory/add` | 写入一条记忆 |
 | `POST /api/memory/batch_add` | 批量写入记忆（迁移/导入用） |
 | `POST /api/memory/chat` | 接收桌宠对话，交给记忆插件做后台总结 |
+
+> **会话参数为必填**：调用 `/api/memory/search`、`/recall`、`/evidence`、`/add`、`/memorize`、`/batch_add`、`/forget`、`/reflect`、`/chat` 时必须显式传 `session_id`，格式 `<persona>:<MessageType>:<id>`（如 `MyBot:GroupMessage:123456789`、`MyBot:FriendMessage:10000`）。缺少 session 时读接口返回 `count: 0` + `code: missing_session`，写接口返回 400 `missing_session`，不再回落到默认会话。
+>
+
 | `POST /api/memory/reflect` | 手动触发一次会话总结 |
 | `GET /api/tools/manifest` | 下发当前可用工具清单与版本，桌宠侧据此动态生成工具 |
 | `POST /api/memory/memorize` | 深度结构化沉淀（提炼关键事实与情感倾向） |
@@ -121,7 +141,7 @@ git clone https://github.com/HirannU-OVO/astrbot_plugin_coopanion_livingmemory.g
 
 `/api/memory/search` 除了单个 `query`，还可以传 `queries`（字符串数组，最多 4 段）。桥端逐段检索、再用 RRF 把各路结果融合成一份，适合一次问几件事、或把长问题拆成几个关键词。
 
-不传 `queries` 时行为与单段完全一致，原有调用方不受影响。**这一项需要桥端 0.2.3 及以上**：旧版会忽略这个字段、按空查询返回无关结果。
+不传 `queries` 时行为与单段完全一致，原有调用方不受影响。**这一项需要桥端 2.3.0 及以上**：旧版会忽略这个字段、按空查询返回无关结果。
 
 ### 关键词子串增强（`recall_keyword_boost`）
 
@@ -138,8 +158,9 @@ git clone https://github.com/HirannU-OVO/astrbot_plugin_coopanion_livingmemory.g
 | 面板显示名 | 配置 id | 类型 | 默认值 | 说明 |
 | :--- | :--- | :---: | :---: | :--- |
 | 监听端口 | `port` | 整数 | `6198` | 桌宠桥的监听端口，两边必须一致 |
+| 监听地址 | `host` | 字符串 | `127.0.0.1` | 默认只允许本机；外部机器连过来要改成 `0.0.0.0`，并设置校验 token |
 | 校验 token | `auth_token` | 字符串 | 无 | 和桌宠扩展填同一串；留空不校验 |
-| 使用场景 | `usage_mode` | 单选 | `接入 QQ` (`qq`) | 接入 QQ 才有平台账号；纯桌宠只有本机 |
+| 使用场景 | `usage_mode` | 单选 | `接入 AstrBot` (`qq`) | 接入 AstrBot 才有平台账号；纯桌宠只有本机 |
 | 记忆共享模式 | `memory_share_mode` | 单选 | `一起记` (`shared`) | 一起记＝两边共用一套；桌宠单独记＝各记各的 |
 | 桌宠的 QQ 号 | `bot_qq` | 字符串 | 自动检测 | 机器人的 QQ 号，留空由首次连接自动识别 |
 | 桌宠的称呼 | `bot_name` | 字符串 | 自动检测 | 机器人的名字，留空由首次连接自动识别 |
@@ -151,6 +172,8 @@ git clone https://github.com/HirannU-OVO/astrbot_plugin_coopanion_livingmemory.g
 | 记忆存给哪个人格 | `default_persona_id` | 字符串 | 自动检测 | 留空自动识别当前活跃人格，一般不用填 |
 | 桌宠单独记的人格 | `pet_persona_id` | 字符串 | 自动检测 | 独立记录时的人格，留空自动补充「-桌宠」 |
 | 记忆存到哪个会话（高级） | `default_session_id` | 字符串 | 自动检测 | 会话标识，留空自动挑记忆最多的历史会话 |
+| 让桌宠读取群聊记忆 | `group_memory_read_enabled` | 布尔 | `false` | 关闭时只读自己私聊记忆、也不写群聊记忆；开启后才按下面的列表读取 |
+| 私聊额外读取的群会话 | `read_scope_sessions` | 列表 | 无 | 一行一个群号；自动用当前适配器 ID 组装会话，旧文本配置仍兼容 |
 | 消息从哪个平台进来（高级） | `default_adapter_id` | 字符串 | 无 | 高级项，多适配器互通时才填，一般留空 |
 | 关键词子串增强 | `recall_keyword_boost` | 布尔 | `true` | 检索时额外走一条关键词子串，专有名词、工具名、型号、文件名这类稀有词靠它稳定召回；关掉后与没有这条时一致 |
 
@@ -162,6 +185,24 @@ git clone https://github.com/HirannU-OVO/astrbot_plugin_coopanion_livingmemory.g
 
 纯桌宠模式下，接 QQ 才用的项会被隐藏，隐藏期间不生效，值保留。
 
+### 外部机器连接
+
+默认只监听 `127.0.0.1`，其他机器上的桌宠连不上。需要跨机使用时：
+
+1. 把「监听地址」改成 `0.0.0.0` 并保存；
+2. **同时设置「校验 token」**（绑 `0.0.0.0` 且 token 为空等于把记忆 API 开放给整个局域网）；
+3. 桌宠扩展的「AstrBot 的地址」填这台机器的局域网 IP + 端口，token 填同一串。
+
+### 让私聊读到群聊记忆
+
+群聊记忆按群会话隔离，私聊默认读不到。需要让桌宠在私聊里也能想起某个群：
+
+1. 在 AstrBot 面板的桥接插件配置里找到「私聊里额外读取哪些群」；
+2. 点「+」一行加一个群号（只填数字即可，例如 `123456789`；也可以填完整 `<适配器>:GroupMessage:<群号>`）；
+3. 保存即生效（该值在桥接启动时读取，改完若没生效就重载一次插件）。
+
+群聊查询仍只读当前群，不会被这个配置带出其他群；它只影响私聊/桌宠侧的检索范围。
+
 ### 常见误解
 
 - **「记忆存到哪个会话」只影响桌宠那份记忆。** QQ 群聊和私聊仍按上游自己的会话规则走。
@@ -169,7 +210,7 @@ git clone https://github.com/HirannU-OVO/astrbot_plugin_coopanion_livingmemory.g
 - **「谁是谁」里第一段是显示名，后面都是别名。** 一个号只有一个主名字，别名只是辅助、可挂多个、不会替换主名字；这一项只对桌宠通道生效，QQ 侧走上游自己的用户身份别名。
 - **接 QQ 时「你的称呼」不参与显示。** 以「谁是谁」为准；未登记的号显示数字本身。
 - **`default_adapter_id` 只在接入第二个适配器并启用互通时才需要填。** 单适配器留空即可。
-- **选「纯桌宠」时后面那些平台项会消失。** 它们只对 QQ 通道有意义；想看回来把「使用场景」切回「接入 QQ」。
+- **选「纯桌宠」时后面那些平台项会消失。** 它们只对 QQ 通道有意义；想看回来把「使用场景」切回「接入 AstrBot」。
 
 ## 常见排障
 

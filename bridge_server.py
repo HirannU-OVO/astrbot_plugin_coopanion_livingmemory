@@ -42,6 +42,8 @@ SUPPORTED_PLATFORMS = frozenset({"aiocqhttp", LOCAL_PLATFORM})
 LOCAL_PLATFORM_PREFIXES = frozenset(
     {"coopanion", "desktop-pet", "desktop_pet", "local", "import", "manual"}
 )
+MEMORY_SESSION_TEMPLATE = "{adapter}:GroupMessage:{group}"
+
 KNOWN_PLATFORM_NAMES = frozenset(
     {
         "aiocqhttp",
@@ -60,8 +62,7 @@ KNOWN_PLATFORM_NAMES = frozenset(
 )
 
 
-VERSION = "0.2.3"
-
+VERSION = "2.3.0-dev32"
 # ---- 多段检索（/api/memory/search 的可选 queries） ----
 # 仅在调用方显式传 queries 时启用；不传时走的仍是原来的单段路径，行为一字不变。
 _SEGMENT_SPLIT_RE = re.compile(r"[，。；！？,;!?\r\n]+")
@@ -99,7 +100,9 @@ class LivingMemoryBridgeServer:
         self.context = context
         self.config = config
         self.upstream = UpstreamLivingMemoryAdapter(context)
-        self.host = config.get("host", "127.0.0.1")
+        self.host = str(config.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+        # 0.0.0.0 / :: 只用于监听，本机自检仍要走回环地址。
+        self._probe_host = "127.0.0.1" if self.host in {"0.0.0.0", "::", "[::]"} else self.host
         self.port = int(config.get("port", 6198))
         # 开源默认值不带任何真实账号：留空时先自动检测，检测不到才用占位
         self.default_session_id = str(
@@ -132,6 +135,27 @@ class LivingMemoryBridgeServer:
         self.read_scope_sessions_text = str(
             config.get("read_scope_sessions_text") or ""
         )
+        self.read_scope_sessions_raw = config.get("read_scope_sessions") or []
+        # 旧配置迁移：老用户没有这个开关，但已经配了额外读取群，视为开启
+        legacy_scope_configured = bool(
+            self._as_scope_items(self.read_scope_sessions_raw)
+            or self.read_scope_sessions_text.strip()
+        )
+        if "group_memory_read_enabled" not in config and legacy_scope_configured:
+            self.group_memory_read_enabled = True
+        else:
+            self.group_memory_read_enabled = bool(
+                config.get("group_memory_read_enabled", False)
+            )
+        if not self._as_scope_items(self.read_scope_sessions_raw) and self.read_scope_sessions_text.strip():
+            migrated = [
+                item.strip()
+                for item in re.split(r"[,，;；\n]", self.read_scope_sessions_text)
+                if item.strip()
+            ]
+            if migrated:
+                self.read_scope_sessions_raw = migrated
+                self._persist_migrated_read_scope(migrated)
         self._mode_state: dict[str, Any] = {}
         self._persona_filtering_warning = ""
         self._persona_filtering_logged = False
@@ -255,6 +279,7 @@ class LivingMemoryBridgeServer:
             f"bridge_{int(time.time() * 1000)}_{os.getpid()}_{uuid.uuid4().hex[:6]}"
         )
         self.started_at = time.time()
+        self.missing_session_total = 0
         self.state = "starting"
 
         self._setup_routes()
@@ -274,7 +299,7 @@ class LivingMemoryBridgeServer:
 
     async def _probe_port(self) -> tuple[str, dict[str, Any] | None]:
         import aiohttp
-        url = f"http://{self.host}:{self.port}/api/health"
+        url = f"http://{self._probe_host}:{self.port}/api/health"
         headers = {}
         if self.auth_token:
             headers["Authorization"] = f"Bearer {self.auth_token}"
@@ -565,6 +590,42 @@ class LivingMemoryBridgeServer:
             return "未知"
         return self._PLATFORM_DISPLAY.get(code.casefold(), code)
 
+    @staticmethod
+    def _as_scope_items(raw: Any) -> list[str]:
+        if isinstance(raw, (list, tuple)):
+            return [str(item).strip() for item in raw if str(item).strip()]
+        text = str(raw or "").strip()
+        if not text:
+            return []
+        return [item.strip() for item in re.split(r"[,，;；\n]", text) if item.strip()]
+
+    def _normalize_scope_item(self, raw: str) -> str:
+        """群号 → <适配器>:GroupMessage:<群号>；完整三段 id 原样接受。"""
+        item = str(raw or "").strip()
+        if not item:
+            return ""
+        if item.isdigit():
+            adapter = self._session_adapter_id()
+            if not adapter or adapter in {"None", "none", "null"}:
+                logger.warning(
+                    f"[LivingMemoryBridge] 读取范围里的群号 {item} 无法解析适配器 ID，已忽略"
+                )
+                return ""
+            return MEMORY_SESSION_TEMPLATE.format(adapter=adapter, group=item)
+        parts = [p for p in item.split(":") if p]
+        if len(parts) >= 3 and "group" in parts[1].casefold():
+            return MEMORY_SESSION_TEMPLATE.format(adapter=parts[0], group=parts[-1])
+        if len(parts) == 2 and "group" in parts[0].casefold():
+            adapter = self._session_adapter_id()
+            if not adapter or adapter in {"None", "none", "null"}:
+                logger.warning(
+                    f"[LivingMemoryBridge] 读取范围里的会话 {item} 无法解析适配器 ID，已忽略"
+                )
+                return ""
+            return MEMORY_SESSION_TEMPLATE.format(adapter=adapter, group=parts[-1])
+        logger.warning(f"[LivingMemoryBridge] 读取范围条目无法识别，已忽略: {item}")
+        return ""
+
     def _read_scope_sessions(self, session_id: str) -> list[str]:
         """私聊/桌宠读取时额外纳入的群会话；群会话本身只读自己。"""
         sid = str(session_id or "").strip()
@@ -572,20 +633,28 @@ class LivingMemoryBridgeServer:
             return [sid] if sid else []
         parts = [p for p in sid.split(":") if p]
         is_group = len(parts) > 1 and "group" in parts[1].casefold()
-        if is_group:
+        if is_group or sid.endswith("#pet"):
             return [sid] if sid else []
-        extra: list[str] = []
-        for raw in re.split(r"[,，;；\n]", self.read_scope_sessions_text or ""):
-            item = raw.strip()
-            if not item or item == sid or item in extra:
+        if not self.group_memory_read_enabled:
+            return [sid] if sid else []
+        seen: set[str] = set()
+        merged: list[str] = []
+        for raw in self._as_scope_items(self.read_scope_sessions_raw) + [
+            item.strip()
+            for item in re.split(r"[,，;；\n]", self.read_scope_sessions_text or "")
+            if item.strip()
+        ]:
+            item = self._normalize_scope_item(raw)
+            if not item or item in seen or item == sid:
                 continue
             if not self._is_supported_platform(self._session_platform(item)):
                 logger.warning(
                     f"[LivingMemoryBridge] 读取范围里的会话 {item} 平台暂未支持，已忽略"
                 )
                 continue
-            extra.append(item)
-        return ([sid] if sid else []) + extra
+            seen.add(item)
+            merged.append(item)
+        return ([sid] if sid else []) + merged
 
     async def _search_with_read_scope(
         self,
@@ -630,26 +699,37 @@ class LivingMemoryBridgeServer:
     def _effective_pet_persona(self) -> str:
         if self.pet_persona_id:
             return self.pet_persona_id
-        base = self.default_persona_id
-        if not base or base == "default":
-            base = "默认"
-        return f"{base}-桌宠"
+        if not getattr(self, "_pet_persona_warned", False):
+            self._pet_persona_warned = True
+            logger.warning(
+                "[LivingMemoryBridge] pet_persona_id 为空，桌宠单独记忆回落 default_persona_id"
+            )
+        return self.default_persona_id
 
-    def _effective_persona(self, requested: Any = None) -> str:
+    def _request_memory_mode(self, data: dict[str, Any]) -> str:
+        """单次请求可覆盖记忆模式；未带时回落桥配置。"""
+        raw = str(data.get("memory_mode") or "").strip().lower()
+        if raw in ("shared", "pet_only"):
+            return raw
+        return self.memory_share_mode
+
+    def _effective_persona(self, requested: Any = None, mode: str | None = None) -> str:
+        active = mode or self.memory_share_mode
         if self.usage_mode == "local":
             return str(requested or "").strip() or self.default_persona_id
-        if self.memory_share_mode == "pet_only":
+        if active == "pet_only":
             return self._effective_pet_persona()
         return str(requested or "").strip() or self.default_persona_id
 
-    def _chat_storage_session(self, session_id: str) -> str:
+    def _chat_storage_session(self, session_id: str, mode: str | None = None) -> str:
         """桌宠单独记时，把桌宠对话挪到独立会话，避免混进 QQ 的总结窗口。"""
-        if self.usage_mode == "local" or self.memory_share_mode != "pet_only":
+        active = mode or self.memory_share_mode
+        if self.usage_mode == "local" or active != "pet_only":
             return str(session_id or "").strip()
         sid = str(session_id or "").strip()
         if not sid:
             return "local:pet#pet"
-        if sid.endswith("#pet"):
+        if sid.endswith("#pet") or "GroupMessage" in sid:
             return sid
         return f"{sid}#pet"
 
@@ -853,10 +933,15 @@ class LivingMemoryBridgeServer:
             self._bot_session_cache[session_id] = result
         return result
 
-    @staticmethod
-    def _session_user_id_for(session_id: str, bot_id: str = "") -> str:
-        """从会话 umo 的冒号段里取用户数字账号（排除 bot 账号）。"""
+    def _session_user_id_for(self, session_id: str, bot_id: str = "") -> str:
+        """从 umo 里取用户 QQ；群会话返回配置里的主人账号，绝不把群号当人。"""
         parts = [p for p in str(session_id or "").split(":") if p]
+        if len(parts) >= 2 and "group" in parts[1].casefold():
+            for uid in getattr(self, "user_display_names", {}) or {}:
+                uid_s = str(uid or "").strip()
+                if uid_s.isdigit() and uid_s != bot_id:
+                    return uid_s
+            return ""
         return next((p for p in parts[1:] if p.isdigit() and p != bot_id), "")
 
     async def _persona_exists(self, persona_id: str) -> bool:
@@ -1186,15 +1271,42 @@ class LivingMemoryBridgeServer:
                     revision = await reader(session_id)
                 except Exception:
                     revision = None
-            plan = await mr._build_reflection_plan_for_cursor(
-                session_id,
-                int(total),
-                int(last or 0),
-                pending,
-                revision,
-                persona,
-                session_id,
-            )
+            # 上游签名会变：老版是 (session_id, total, last, pending, revision,
+            # persona, scope)，新版改成 (session_id, total, expected_revision,
+            # persona, memory_scope)。按参数个数择一，两边都能跑。
+            builder = mr._build_reflection_plan_for_cursor
+            nparams = None
+            try:
+                import inspect as _inspect
+
+                nparams = len(
+                    [
+                        p
+                        for p in _inspect.signature(builder).parameters.values()
+                        if p.kind
+                        in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                    ]
+                )
+            except Exception:
+                nparams = None
+            if nparams is not None and nparams <= 5:
+                plan = await builder(
+                    session_id,
+                    int(total),
+                    revision,
+                    persona,
+                    session_id,
+                )
+            else:
+                plan = await builder(
+                    session_id,
+                    int(total),
+                    int(last or 0),
+                    pending,
+                    revision,
+                    persona,
+                    session_id,
+                )
             if plan is None:
                 return {
                     "ok": True,
@@ -1293,6 +1405,40 @@ class LivingMemoryBridgeServer:
             logger.warning("[LivingMemoryBridge] 旧映射回写失败：配置对象没有保存接口")
         except Exception as e:
             logger.warning(f"[LivingMemoryBridge] 旧映射回写失败: {e}")
+
+    def _persist_migrated_read_scope(self, entries: list[str]) -> None:
+        """旧文本迁移成 read_scope_sessions 列表，写回一次；失败不影响运行。"""
+        if not entries:
+            return
+        patch = {"read_scope_sessions": entries}
+        try:
+            saver = getattr(self.config, "save_config", None)
+            if callable(saver):
+                saver(patch)
+                logger.info(
+                    f"[LivingMemoryBridge] 已从旧文本迁移 {len(entries)} 个群到「私聊额外读取」列表"
+                )
+                return
+            async_saver = getattr(self.config, "save_config_async", None)
+            if callable(async_saver):
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    return
+
+                def _done(task: asyncio.Task) -> None:
+                    try:
+                        if task.result():
+                            logger.info(
+                                f"[LivingMemoryBridge] 已从旧文本迁移 {len(entries)} 个群到「私聊额外读取」列表"
+                            )
+                    except Exception as e:
+                        logger.warning(f"[LivingMemoryBridge] 读取范围迁移回写失败: {e}")
+
+                task = loop.create_task(async_saver(patch))
+                task.add_done_callback(_done)
+        except Exception as e:
+            logger.warning(f"[LivingMemoryBridge] 读取范围迁移回写失败: {e}")
 
     @staticmethod
     def _parse_user_map(raw: Any) -> dict[str, str]:
@@ -1616,6 +1762,7 @@ class LivingMemoryBridgeServer:
                 "schema_version": SCHEMA_VERSION,
                 "tools_schema_version": TOOLS_SCHEMA_VERSION,
                 "plugin_version": VERSION,
+                "missing_session_total": self.missing_session_total,
                 "upstream": {
                     "ready": connected,
                     "version": capability["upstream_version"],
@@ -1635,6 +1782,8 @@ class LivingMemoryBridgeServer:
                 "memory_share_mode": self.memory_share_mode,
                 "pet_persona_id": self._effective_pet_persona(),
                 "persona_filtering": self._persona_filtering_enabled(),
+                "group_memory_read_enabled": self.group_memory_read_enabled,
+                "read_scope_sessions": self._read_scope_sessions(self.default_session_id),
                 "persona_filtering_warning": self._persona_filtering_warning,
                 "mode_state": self._mode_state,
                 "resolved_session_id": self.default_session_id,
@@ -1709,6 +1858,33 @@ class LivingMemoryBridgeServer:
             }
         )
 
+    def _require_session(
+        self, data: dict[str, Any], *, endpoint: str = "", write: bool = False
+    ) -> tuple[str, Any]:
+        """统一会话校验：不带 session 一律拒绝，绝不回落到 default_session_id。"""
+        raw = str(data.get("session_id") or "").strip()
+        if raw:
+            return raw, None
+        self.missing_session_total += 1
+        logger.warning(
+            f"[LivingMemoryBridge] {endpoint or '接口'} 调用方未提供 session，已拒绝"
+        )
+        if write:
+            return "", web.json_response(
+                {"ok": False, "code": "missing_session", "error": "调用方未提供 session"},
+                status=400,
+            )
+        return "", web.json_response(
+            {
+                "ok": True,
+                "count": 0,
+                "memories": [],
+                "results": [],
+                "code": "missing_session",
+                "warning": "调用方未提供 session",
+            }
+        )
+
     async def handle_search(self, request: web.Request) -> web.Response:
         """POST /api/memory/search - 多路混合语义与图谱检索 (mem_search)"""
         await self._ensure_auto()
@@ -1729,6 +1905,7 @@ class LivingMemoryBridgeServer:
                 {"ok": False, "code": "invalid_json", "error": "无效的 JSON 请求体"}, status=400
             )
 
+        memory_mode_raw = str(data.pop("memory_mode", "") or "").strip()
         # 严格契约参数校验
         valid, err = validate_tool_params("mem_search", data)
         if not valid and err:
@@ -1736,8 +1913,14 @@ class LivingMemoryBridgeServer:
 
         query = str(data.get("query", "")).strip()
         limit = max(1, min(20, int(data.get("limit", 5))))
-        session_id = data.get("session_id") or self.default_session_id
-        persona_id = self._effective_persona(data.get("persona_id"))
+        session_id, missing = self._require_session(
+            data, endpoint="/api/memory/search", write=False
+        )
+        if missing is not None:
+            return missing
+        memory_mode = self._request_memory_mode({"memory_mode": memory_mode_raw})
+        session_id = self._chat_storage_session(session_id, memory_mode)
+        persona_id = self._effective_persona(data.get("persona_id"), memory_mode)
 
         # 可选多段检索：只有调用方显式传 queries 且超过 1 段时才走新路径，
         # 其余情况（含不传 queries）保持原来的单段实现，行为与改前完全一致。
@@ -2161,7 +2344,11 @@ class LivingMemoryBridgeServer:
 
         content = str(data.get("content", "")).strip()
         importance = float(data.get("importance", 0.6))
-        session_id = data.get("session_id") or self.default_session_id
+        session_id, missing = self._require_session(
+            data, endpoint="/api/memory/record", write=True
+        )
+        if missing is not None:
+            return missing
         persona_id = self._effective_persona(data.get("persona_id"))
         platform = self._session_platform(session_id, data.get("platform"))
         if not self._is_supported_platform(platform):
@@ -2250,7 +2437,11 @@ class LivingMemoryBridgeServer:
             sentiment = "neutral"
         importance = float(data.get("importance", 0.7))
         reason_text = str(data.get("reason", "")).strip()
-        session_id = str(data.get("session_id") or self.default_session_id)
+        session_id, missing = self._require_session(
+            data, endpoint="/api/memory/memorize", write=True
+        )
+        if missing is not None:
+            return missing
         persona_id = self._effective_persona(data.get("persona_id"))
 
         is_group_chat = "GroupMessage" in session_id
@@ -2349,7 +2540,11 @@ class LivingMemoryBridgeServer:
         limit = max(1, min(20, int(data.get("limit", 5))))
         include_source = bool(data.get("include_source", False))
         target = str(data.get("target") or "conversation").strip()
-        session_id = str(data.get("session_id") or self.default_session_id)
+        session_id, missing = self._require_session(
+            data, endpoint="/api/memory/recall", write=False
+        )
+        if missing is not None:
+            return missing
         persona_id = self._effective_persona(data.get("persona_id"))
 
         if target == "current_speaker":
@@ -2445,6 +2640,11 @@ class LivingMemoryBridgeServer:
         if not valid and err:
             return web.json_response(err, status=422)
 
+        session_id, missing = self._require_session(
+            data, endpoint="/api/memory/evidence", write=False
+        )
+        if missing is not None:
+            return missing
         memory_id = int(data.get("memory_id"))
         include_source = bool(data.get("include_source", False))
         cursor = str(data.get("cursor", "")).strip()
@@ -2464,7 +2664,7 @@ class LivingMemoryBridgeServer:
 
             doc = await read_memory_evidence_core(
                 memory_engine=engine,
-                recall_session_id=self.default_session_id,
+                recall_session_id=session_id,
                 recall_persona_id=self.default_persona_id,
                 memory_id=memory_id,
                 include_source=include_source,
@@ -2523,6 +2723,12 @@ class LivingMemoryBridgeServer:
         if not valid and err:
             return web.json_response(err, status=422)
 
+        session_id, missing = self._require_session(
+            data, endpoint="/api/memory/forget", write=True
+        )
+        if missing is not None:
+            return missing
+
         memory_ids = data.get("memory_ids") or []
         if not memory_ids:
             return web.json_response(
@@ -2571,7 +2777,7 @@ class LivingMemoryBridgeServer:
                 audit={
                     "archived_by": "bridge_tool",
                     "archive_reason": reason_text,
-                    "session_id": self.default_session_id,
+                    "session_id": session_id,
                 },
             )
             return web.json_response(
@@ -2619,6 +2825,19 @@ class LivingMemoryBridgeServer:
                 {"ok": False, "error": "memories 必须为非空列表"}, status=400
             )
 
+        raw_session = str(data.get("session_id") or "").strip()
+        if not raw_session:
+            item_sessions = [
+                str(item.get("session_id") or "").strip()
+                for item in items
+                if isinstance(item, dict)
+            ]
+            if not item_sessions or any(not sid for sid in item_sessions):
+                _, missing = self._require_session(
+                    data, endpoint="/api/memory/batch_add", write=True
+                )
+                return missing
+
         added_ids = []
         errors = []
 
@@ -2627,7 +2846,7 @@ class LivingMemoryBridgeServer:
             if not content:
                 continue
             importance = float(item.get("importance", 0.5))
-            session_id = item.get("session_id") or self.default_session_id
+            session_id = str(item.get("session_id") or raw_session)
             persona_id = self._effective_persona(item.get("persona_id"))
             platform = self._session_platform(session_id, item.get("platform"))
             if not self._is_supported_platform(platform):
@@ -2682,7 +2901,11 @@ class LivingMemoryBridgeServer:
             data = await request.json()
         except Exception:
             data = {}
-        session_id = str(data.get("session_id") or self.default_session_id).strip()
+        session_id, missing = self._require_session(
+            data, endpoint="/api/memory/reflect", write=True
+        )
+        if missing is not None:
+            return missing
         persona_id = self._effective_persona(data.get("persona_id"))
         result = await self._run_reflection(
             self._chat_storage_session(session_id), persona_id
@@ -2714,13 +2937,27 @@ class LivingMemoryBridgeServer:
                 {"ok": False, "error": "turns 必须为非空列表"}, status=400
             )
 
-        default_session_id = str(
-            data.get("session_id")
-            if "session_id" in data
-            else self.default_session_id
-        ).strip()
+        raw_session = str(data.get("session_id") or "").strip()
+        turn_sessions = [
+            str(t.get("session_id") or "").strip()
+            for t in turns
+            if isinstance(t, dict)
+        ]
+        if not raw_session and (not turn_sessions or any(not sid for sid in turn_sessions)):
+            self.missing_session_total += 1
+            logger.warning(
+                "[LivingMemoryBridge] /api/memory/chat 调用方未提供 session，拒绝写入"
+            )
+            return web.json_response(
+                {"ok": False, "code": "missing_session", "error": "调用方未提供 session"},
+                status=400,
+            )
+        default_session_id = raw_session or (turn_sessions[0] if turn_sessions else "")
+        if not self.group_memory_read_enabled and "GroupMessage" in default_session_id:
+            return web.json_response({"ok": True, "recorded": 0, "ignored": "group_memory_disabled"})
+        memory_mode = self._request_memory_mode(data)
         default_platform = data.get("platform")
-        default_persona_id = self._effective_persona(data.get("persona_id"))
+        default_persona_id = self._effective_persona(data.get("persona_id"), memory_mode)
         recorded = 0
         reflected: list[tuple[str, str]] = []
         skipped_identity = 0
@@ -2734,18 +2971,20 @@ class LivingMemoryBridgeServer:
 
             ts = turn.get("timestamp") or time.time()
             is_bot = role == "assistant"
-            # 支持每个 turn 自带会话/人格/平台（群聊、多平台与多会话）
-            session_id = str(
-                turn.get("session_id")
-                if "session_id" in turn
-                else default_session_id
-            ).strip()
+            # 每个 turn 必须自带会话；顶层 session 不得回落给缺少 session 的 turn。
+            session_id = str(turn.get("session_id") or "").strip()
+            if not session_id:
+                skipped_unsupported += 1
+                continue
+            if not self.group_memory_read_enabled and "GroupMessage" in session_id:
+                skipped_unsupported += 1
+                continue
             persona_id = (
-                self._effective_persona(turn.get("persona_id"))
-                if self.memory_share_mode == "pet_only"
+                self._effective_persona(turn.get("persona_id"), memory_mode)
+                if memory_mode == "pet_only"
                 else str(turn.get("persona_id") or "").strip() or default_persona_id
             )
-            storage_session_id = self._chat_storage_session(session_id)
+            storage_session_id = self._chat_storage_session(session_id, memory_mode)
             platform = self._session_platform(
                 session_id, turn.get("platform") or default_platform
             )

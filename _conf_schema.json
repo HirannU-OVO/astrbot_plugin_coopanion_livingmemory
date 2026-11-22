@@ -5,6 +5,12 @@
     "default": 6198,
     "hint": "桌宠桥的监听端口，两边必须一致"
   },
+  "host": {
+    "type": "string",
+    "description": "监听地址",
+    "default": "127.0.0.1",
+    "hint": "默认只允许本机连接；需要其他机器上的桌宠连接时改成 0.0.0.0，并务必设置校验 token"
+  },
   "auth_token": {
     "type": "string",
     "description": "校验 token",
@@ -20,13 +26,14 @@
       "local"
     ],
     "labels": [
-      "接入 QQ",
+      "接入 AstrBot",
       "纯桌宠"
     ],
-    "hint": "纯桌宠只有本机；接入 QQ 才有平台账号"
+    "hint": "纯桌宠只有本机；接入 AstrBot 才有平台账号"
   },
   "memory_share_mode": {
     "type": "string",
+    "invisible": true,
     "description": "记忆共享模式",
     "default": "shared",
     "options": [
@@ -41,6 +48,34 @@
     "condition": {
       "usage_mode": "qq"
     }
+  },
+  "group_memory_read_enabled": {
+    "type": "bool",
+    "description": "群聊也进记忆",
+    "default": false,
+    "hint": "影响：AstrBot 和桌宠两边；关闭后群聊不写入、不总结、不召回。",
+    "condition": {
+      "usage_mode": "qq"
+    }
+  },
+  "read_scope_sessions": {
+    "type": "list",
+    "description": "额外读取这些群的记忆",
+    "default": [],
+    "hint": "一行一个纯群号，后端自动组装会话；影响 AstrBot 和桌宠两边。",
+    "condition": {
+      "usage_mode": "qq"
+    }
+  },
+  "read_scope_sessions_text": {
+    "type": "text",
+    "description": "额外读取这些群的记忆（高级 · 文本配置）",
+    "default": "",
+    "hint": "按文本填写，一行一个群号。与上面的列表等效，影响 AstrBot 和桌宠两边；新配置建议用上面的列表。",
+    "condition": {
+      "usage_mode": "qq"
+    },
+    "invisible": true
   },
   "bot_qq": {
     "type": "string",
@@ -141,16 +176,6 @@
     "description": "消息从哪个平台进来（高级）",
     "default": "",
     "hint": "高级项，多适配器互通时才要填，一般留空",
-    "condition": {
-      "usage_mode": "qq"
-    }
-  },
-  "read_scope_sessions_text": {
-    "type": "text",
-    "description": "私聊额外读取的群会话",
-    "default": "",
-    "hint": "私聊检索时额外并入的群会话，一般留空",
-    "invisible": true,
     "condition": {
       "usage_mode": "qq"
     }

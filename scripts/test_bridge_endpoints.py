@@ -164,7 +164,7 @@ async def run_tests():
 
     # 测试 handle_memorize
     mem_req = MockJsonRequest({
-        "content": "羽羽答应周末去钓鱼",
+        "content": "小明答应周末去钓鱼",
         "topics": ["钓鱼", "周末"],
         "key_facts": ["时间是周六"],
         "sentiment": "positive",
