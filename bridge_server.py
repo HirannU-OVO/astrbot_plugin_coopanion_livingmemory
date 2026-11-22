@@ -62,7 +62,7 @@ KNOWN_PLATFORM_NAMES = frozenset(
 )
 
 
-VERSION = "2.3.0-dev32"
+VERSION = "2.4.0"
 # ---- 多段检索（/api/memory/search 的可选 queries） ----
 # 仅在调用方显式传 queries 时启用；不传时走的仍是原来的单段路径，行为一字不变。
 _SEGMENT_SPLIT_RE = re.compile(r"[，。；！？,;!?\r\n]+")
