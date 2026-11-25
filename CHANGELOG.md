@@ -2,6 +2,34 @@
 
 本文件记录「LivingMemory 桌宠直连桥接 (astrbot_plugin_coopanion_livingmemory)」插件的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.0] - 2026-11-25
+
+配套版本：
+
+- Coopanion 侧扩展 `cortico-world-astrbot-livingmemory` 0.2.6 或更高
+- AstrBot 侧插件 `astrbot_plugin_coopanion_livingmemory` 2.5.0 或更高
+
+两侧要一起升级，只升一侧面板项会对不上。
+
+### 新增
+
+- **群聊记忆读写分档**：群聊的写入与读取各拆成三档——全部群 / 指定群 / 关闭，面板新增 `group_memory_write_scope`、`group_memory_write_allow`、`group_memory_read_scope`、`group_memory_read_allow` 四项。上一版只有一个「群聊也进记忆」开关同时管写入和读取，想「写进群记忆但不读群记忆」或者反过来都做不到，这次两边可以分别设。
+- **检索侧可指定会话范围**：检索请求新增 `extra_scopes`，私聊检索时可以显式指定额外读取哪些群的记忆；每条结果多一个 `scope_source` 标明来源（`own` 是本会话，`group:<群号>` 是某个群），能看出这条记忆从哪儿来。
+
+### 面板
+
+- 群聊记忆的选项从单个开关拆成「写入」「读取」两组；两个「指定群」列表只在各自下拉选了「指定群」时才出现。
+
+### 兼容
+
+- 旧配置自动迁移，老用户升级后不用重配：
+  - 旧开关开着、且配了要读的群 → 写入全部群、读取指定群
+  - 旧开关开着、但没配群 → 写入全部群、读取关闭
+  - 旧开关存在但关着 → 写入关闭、读取关闭
+  - 没有旧开关这一项（全新安装）→ 写入全部群、读取关闭
+
+  迁移结果会回写配置，并在日志里注明。
+
 ## [2.4.0] - 2026-11-22
 
 配套版本：

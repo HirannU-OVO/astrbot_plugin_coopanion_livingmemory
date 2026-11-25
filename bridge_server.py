@@ -62,7 +62,7 @@ KNOWN_PLATFORM_NAMES = frozenset(
 )
 
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 # ---- 多段检索（/api/memory/search 的可选 queries） ----
 # 仅在调用方显式传 queries 时启用；不传时走的仍是原来的单段路径，行为一字不变。
 _SEGMENT_SPLIT_RE = re.compile(r"[，。；！？,;!?\r\n]+")
@@ -136,26 +136,45 @@ class LivingMemoryBridgeServer:
             config.get("read_scope_sessions_text") or ""
         )
         self.read_scope_sessions_raw = config.get("read_scope_sessions") or []
-        # 旧配置迁移：老用户没有这个开关，但已经配了额外读取群，视为开启
-        legacy_scope_configured = bool(
-            self._as_scope_items(self.read_scope_sessions_raw)
-            or self.read_scope_sessions_text.strip()
-        )
-        if "group_memory_read_enabled" not in config and legacy_scope_configured:
-            self.group_memory_read_enabled = True
-        else:
-            self.group_memory_read_enabled = bool(
-                config.get("group_memory_read_enabled", False)
+        legacy_scope = self._as_scope_items(self.read_scope_sessions_raw)
+        legacy_read = bool(config.get("group_memory_read_enabled", False))
+        has_write_scope = "group_memory_write_scope" in config
+        has_read_scope = "group_memory_read_scope" in config
+        if not has_write_scope or not has_read_scope:
+            # 一次性迁移：旧 read 开关 + 旧名单 -> 新双三档
+            if legacy_read and legacy_scope:
+                write_scope, read_scope = "all", "allowlist"
+            elif legacy_read:
+                write_scope, read_scope = "all", "off"
+            elif "group_memory_read_enabled" in config:
+                write_scope, read_scope = "off", "off"
+            else:
+                write_scope, read_scope = "all", "off"
+            self.group_memory_write_scope = write_scope
+            self.group_memory_read_scope = read_scope
+            self.group_memory_write_allow = (
+                legacy_scope if write_scope == "allowlist" else []
             )
-        if not self._as_scope_items(self.read_scope_sessions_raw) and self.read_scope_sessions_text.strip():
-            migrated = [
-                item.strip()
-                for item in re.split(r"[,，;；\n]", self.read_scope_sessions_text)
-                if item.strip()
-            ]
-            if migrated:
-                self.read_scope_sessions_raw = migrated
-                self._persist_migrated_read_scope(migrated)
+            self.group_memory_read_allow = (
+                legacy_scope if read_scope == "allowlist" else []
+            )
+            self._persist_group_scope_migration(
+                write_scope, read_scope,
+                self.group_memory_write_allow, self.group_memory_read_allow,
+            )
+        else:
+            ws = str(config.get("group_memory_write_scope") or "all").strip().lower()
+            rs = str(config.get("group_memory_read_scope") or "off").strip().lower()
+            self.group_memory_write_scope = ws if ws in ("all", "allowlist", "off") else "all"
+            self.group_memory_read_scope = rs if rs in ("all", "allowlist", "off") else "off"
+            self.group_memory_write_allow = self._as_scope_items(
+                config.get("group_memory_write_allow") or []
+            )
+            self.group_memory_read_allow = self._as_scope_items(
+                config.get("group_memory_read_allow") or []
+            )
+        self.group_memory_read_enabled = self.group_memory_read_scope != "off"
+        self.group_memory_write_enabled = self.group_memory_write_scope != "off"
         self._mode_state: dict[str, Any] = {}
         self._persona_filtering_warning = ""
         self._persona_filtering_logged = False
@@ -626,6 +645,26 @@ class LivingMemoryBridgeServer:
         logger.warning(f"[LivingMemoryBridge] 读取范围条目无法识别，已忽略: {item}")
         return ""
 
+    @staticmethod
+    def _group_id_from_session(session_id: str) -> str:
+        return str(session_id or "").rstrip("#pet").rsplit(":", 1)[-1]
+
+    def _scope_allows(self, session_id: str, scope: str, allow: list[str]) -> bool:
+        if "GroupMessage" not in str(session_id):
+            return True
+        if scope == "off":
+            return False
+        if scope == "all":
+            return True
+        gid = self._group_id_from_session(session_id)
+        for raw in allow:
+            item = str(raw).strip()
+            if not item:
+                continue
+            if item == gid or item == session_id or item.endswith(f"GroupMessage:{gid}"):
+                return True
+        return False
+
     def _read_scope_sessions(self, session_id: str) -> list[str]:
         """私聊/桌宠读取时额外纳入的群会话；群会话本身只读自己。"""
         sid = str(session_id or "").strip()
@@ -635,15 +674,23 @@ class LivingMemoryBridgeServer:
         is_group = len(parts) > 1 and "group" in parts[1].casefold()
         if is_group or sid.endswith("#pet"):
             return [sid] if sid else []
-        if not self.group_memory_read_enabled:
+        if self.group_memory_read_scope == "off":
             return [sid] if sid else []
+        candidates: list[str] = []
+        if self.group_memory_read_scope == "all":
+            try:
+                candidates.extend(
+                    s for s in self.upstream.session_personas()
+                    if "GroupMessage" in str(s)
+                )
+            except Exception:
+                pass
+            candidates.extend(self.read_scope_sessions_raw)
+        else:
+            candidates.extend(self.group_memory_read_allow)
         seen: set[str] = set()
         merged: list[str] = []
-        for raw in self._as_scope_items(self.read_scope_sessions_raw) + [
-            item.strip()
-            for item in re.split(r"[,，;；\n]", self.read_scope_sessions_text or "")
-            if item.strip()
-        ]:
+        for raw in candidates:
             item = self._normalize_scope_item(raw)
             if not item or item in seen or item == sid:
                 continue
@@ -663,8 +710,16 @@ class LivingMemoryBridgeServer:
         limit: int,
         session_id: str,
         persona_id: str,
+        extra_scopes: list[str] | None = None,
     ) -> list[Any]:
         sessions = self._read_scope_sessions(session_id)
+        if self.group_memory_read_scope != "off" and extra_scopes:
+            seen = set(sessions)
+            for raw in extra_scopes:
+                item = self._normalize_scope_item(raw)
+                if item and item not in seen and item != session_id:
+                    sessions.append(item)
+                    seen.add(item)
         if not sessions:
             return []
         merged: dict[Any, Any] = {}
@@ -683,6 +738,7 @@ class LivingMemoryBridgeServer:
                     )
                     continue
                 raise
+            source = "own" if sid == session_id else f"group:{sid.rsplit(':', 1)[-1]}"
             for row in rows:
                 key = getattr(row, "doc_id", None)
                 if key is None:
@@ -691,6 +747,11 @@ class LivingMemoryBridgeServer:
                 if old is None or getattr(row, "final_score", 0.0) > getattr(
                     old, "final_score", 0.0
                 ):
+                    if self.group_memory_read_scope != "off":
+                        try:
+                            setattr(row, "scope_source", source)
+                        except Exception:
+                            pass
                     merged[key] = row
         out = list(merged.values())
         out.sort(key=lambda row: float(getattr(row, "final_score", 0.0)), reverse=True)
@@ -1440,6 +1501,38 @@ class LivingMemoryBridgeServer:
         except Exception as e:
             logger.warning(f"[LivingMemoryBridge] 读取范围迁移回写失败: {e}")
 
+    def _persist_group_scope_migration(
+        self, write_scope: str, read_scope: str,
+        write_allow: list[str], read_allow: list[str],
+    ) -> None:
+        patch = {
+            "group_memory_write_scope": write_scope,
+            "group_memory_write_allow": write_allow,
+            "group_memory_read_scope": read_scope,
+            "group_memory_read_allow": read_allow,
+        }
+        try:
+            saver = getattr(self.config, "save_config", None)
+            if callable(saver):
+                saver(patch)
+                logger.info(
+                    f"[LivingMemoryBridge] 群记忆三档迁移: write={write_scope}, read={read_scope}"
+                )
+                return
+            async_saver = getattr(self.config, "save_config_async", None)
+            if callable(async_saver):
+                loop = asyncio.get_running_loop()
+                task = loop.create_task(async_saver(patch))
+                task.add_done_callback(
+                    lambda t: logger.info(
+                        f"[LivingMemoryBridge] 群记忆三档迁移已回写: write={write_scope}, read={read_scope}"
+                    ) if not t.exception() else logger.warning(
+                        f"[LivingMemoryBridge] 三档迁移回写失败: {t.exception()}"
+                    )
+                )
+        except Exception as e:
+            logger.warning(f"[LivingMemoryBridge] 三档迁移回写失败: {e}")
+
     @staticmethod
     def _parse_user_map(raw: Any) -> dict[str, str]:
         """解析 user_map：list 每行「QQ号=名字,别名...」；兼容旧 dict 形态。"""
@@ -1782,7 +1875,10 @@ class LivingMemoryBridgeServer:
                 "memory_share_mode": self.memory_share_mode,
                 "pet_persona_id": self._effective_pet_persona(),
                 "persona_filtering": self._persona_filtering_enabled(),
-                "group_memory_read_enabled": self.group_memory_read_enabled,
+                "group_memory_write_scope": self.group_memory_write_scope,
+                "group_memory_write_allow": self.group_memory_write_allow,
+                "group_memory_read_scope": self.group_memory_read_scope,
+                "group_memory_read_allow": self.group_memory_read_allow,
                 "read_scope_sessions": self._read_scope_sessions(self.default_session_id),
                 "persona_filtering_warning": self._persona_filtering_warning,
                 "mode_state": self._mode_state,
@@ -1938,7 +2034,8 @@ class LivingMemoryBridgeServer:
         if len(segments) > 1:
             try:
                 payload = await self._search_multi_segment(
-                    engine, segments, limit, session_id, persona_id
+                    engine, segments, limit, session_id, persona_id,
+                    data.get("extra_scopes") if isinstance(data.get("extra_scopes"), list) else None,
                 )
                 return web.json_response(payload)
             except Exception as e:
@@ -1950,7 +2047,8 @@ class LivingMemoryBridgeServer:
         attempt_query = query or (segments[0] if segments else "")
         try:
             results = await self._search_with_read_scope(
-                engine, attempt_query, limit, session_id, persona_id
+                engine, attempt_query, limit, session_id, persona_id,
+                data.get("extra_scopes") if isinstance(data.get("extra_scopes"), list) else None,
             )
 
             memories = []
@@ -1960,6 +2058,7 @@ class LivingMemoryBridgeServer:
                         "id": getattr(r, "doc_id", None),
                         "content": getattr(r, "content", ""),
                         "score": getattr(r, "final_score", 0.0),
+                        "scope_source": getattr(r, "scope_source", None),
                         "metadata": getattr(r, "metadata", {}) or {},
                     }
                 )
@@ -1972,7 +2071,10 @@ class LivingMemoryBridgeServer:
                         engine, keywords, limit, session_id, persona_id
                     )
                     if keyword_hits:
-                        memories = self._fuse_memories(memories, keyword_hits, limit)
+                        memories = self._fuse_memories(
+                            memories, keyword_hits, limit,
+                            "own" if self.group_memory_read_scope != "off" else None,
+                        )
 
             return web.json_response(
                 {
@@ -2151,6 +2253,7 @@ class LivingMemoryBridgeServer:
         main_memories: list[dict[str, Any]],
         keyword_hits: dict[int, dict[str, Any]],
         limit: int,
+        keyword_scope_source: str | None = None,
     ) -> list[dict[str, Any]]:
         """主路与关键词路 RRF 融合。
 
@@ -2167,6 +2270,7 @@ class LivingMemoryBridgeServer:
                 "id": doc_id,
                 "content": memory.get("content") or "",
                 "score": 1.0 / (_RRF_K + rank + 1),
+                "scope_source": memory.get("scope_source"),
                 "metadata": dict(memory.get("metadata") or {}),
             }
 
@@ -2185,11 +2289,14 @@ class LivingMemoryBridgeServer:
             if existing is not None:
                 existing["score"] += float(hit.get("score") or 0.0)
                 existing["metadata"]["from_keywords"] = metadata["from_keywords"]
+                if existing.get("scope_source") is None:
+                    existing["scope_source"] = keyword_scope_source
             else:
                 fused[doc_id] = {
                     "id": doc_id,
                     "content": item.get("text") or "",
                     "score": float(hit.get("score") or 0.0),
+                    "scope_source": keyword_scope_source,
                     "metadata": metadata,
                 }
 
@@ -2199,6 +2306,7 @@ class LivingMemoryBridgeServer:
                 "id": entry["id"],
                 "content": entry["content"],
                 "score": round(float(entry["score"]), 6),
+                "scope_source": entry.get("scope_source"),
                 "metadata": entry["metadata"],
             }
             for entry in ordered[:limit]
@@ -2211,6 +2319,7 @@ class LivingMemoryBridgeServer:
         limit: int,
         session_id: str,
         persona_id: str,
+        extra_scopes: list[str] | None = None,
     ) -> dict[str, Any]:
         """逐段并行检索，min-max 归一分后按 RRF 融合；整批硬超时 2.5s。
 
@@ -2226,7 +2335,7 @@ class LivingMemoryBridgeServer:
         for index, segment in enumerate(segments):
             task = asyncio.create_task(
                 self._search_with_read_scope(
-                    engine, segment, limit, session_id, persona_id
+                    engine, segment, limit, session_id, persona_id, extra_scopes
                 )
             )
             tasks[task] = index
@@ -2285,6 +2394,7 @@ class LivingMemoryBridgeServer:
                     "id": getattr(row, "doc_id", None),
                     "content": getattr(row, "content", ""),
                     "score": round(entry["score"], 6),
+                    "scope_source": getattr(row, "scope_source", None),
                     "metadata": metadata,
                 }
             )
@@ -2304,7 +2414,10 @@ class LivingMemoryBridgeServer:
                     engine, keywords, limit, session_id, persona_id
                 )
                 if keyword_hits:
-                    memories = self._fuse_memories(memories, keyword_hits, limit)
+                    memories = self._fuse_memories(
+                        memories, keyword_hits, limit,
+                        "own" if self.group_memory_read_scope != "off" else None,
+                    )
 
         payload: dict[str, Any] = {
             "ok": True,
@@ -2953,8 +3066,15 @@ class LivingMemoryBridgeServer:
                 status=400,
             )
         default_session_id = raw_session or (turn_sessions[0] if turn_sessions else "")
-        if not self.group_memory_read_enabled and "GroupMessage" in default_session_id:
-            return web.json_response({"ok": True, "recorded": 0, "ignored": "group_memory_disabled"})
+        if not self._scope_allows(
+            default_session_id,
+            self.group_memory_write_scope,
+            self.group_memory_write_allow,
+        ):
+            return web.json_response(
+                {"ok": True, "recorded": 0, "ignored": "group_memory_write_disabled"}
+            )
+
         memory_mode = self._request_memory_mode(data)
         default_platform = data.get("platform")
         default_persona_id = self._effective_persona(data.get("persona_id"), memory_mode)
@@ -2976,9 +3096,14 @@ class LivingMemoryBridgeServer:
             if not session_id:
                 skipped_unsupported += 1
                 continue
-            if not self.group_memory_read_enabled and "GroupMessage" in session_id:
+            if not self._scope_allows(
+                session_id,
+                self.group_memory_write_scope,
+                self.group_memory_write_allow,
+            ):
                 skipped_unsupported += 1
                 continue
+
             persona_id = (
                 self._effective_persona(turn.get("persona_id"), memory_mode)
                 if memory_mode == "pet_only"

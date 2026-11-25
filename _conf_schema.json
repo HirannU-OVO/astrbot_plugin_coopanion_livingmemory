@@ -49,23 +49,81 @@
       "usage_mode": "qq"
     }
   },
-  "group_memory_read_enabled": {
-    "type": "bool",
-    "description": "群聊也进记忆",
-    "default": false,
-    "hint": "影响：AstrBot 和桌宠两边；关闭后群聊不写入、不总结、不召回。",
+  "group_memory_write_scope": {
+    "type": "string",
+    "description": "群聊记忆写入",
+    "default": "all",
+    "options": [
+      "all",
+      "allowlist",
+      "off"
+    ],
+    "labels": [
+      "全部群",
+      "指定群",
+      "关闭"
+    ],
+    "hint": "影响：AstrBot 和桌宠两边；关闭后 GroupMessage 整条跳过，不写入也不总结。",
     "condition": {
       "usage_mode": "qq"
     }
   },
+  "group_memory_write_allow": {
+    "type": "list",
+    "description": "允许写入的群",
+    "default": [],
+    "hint": "仅「指定群」时生效；一行一个群号，留空等于关闭。",
+    "condition": {
+      "usage_mode": "qq"
+    }
+  },
+  "group_memory_read_scope": {
+    "type": "string",
+    "description": "私聊可读取的群聊记忆",
+    "default": "off",
+    "options": [
+      "all",
+      "allowlist",
+      "off"
+    ],
+    "labels": [
+      "全部群",
+      "指定群",
+      "关闭"
+    ],
+    "hint": "影响：AstrBot 和桌宠两边；关闭后私聊只读自己的记忆。",
+    "condition": {
+      "usage_mode": "qq"
+    }
+  },
+  "group_memory_read_allow": {
+    "type": "list",
+    "description": "私聊可读取的群",
+    "default": [],
+    "hint": "仅「指定群」时生效；一行一个群号，留空等于关闭。",
+    "condition": {
+      "usage_mode": "qq"
+    }
+  },
+  "group_memory_read_enabled": {
+    "type": "bool",
+    "description": "旧版群聊读取开关（兼容读取）",
+    "default": false,
+    "hint": "影响：AstrBot 和桌宠两边；关闭后群聊不写入、不总结、不召回。",
+    "condition": {
+      "usage_mode": "qq"
+    },
+    "invisible": true
+  },
   "read_scope_sessions": {
     "type": "list",
-    "description": "额外读取这些群的记忆",
+    "description": "旧版额外读取群名单（兼容读取）",
     "default": [],
     "hint": "一行一个纯群号，后端自动组装会话；影响 AstrBot 和桌宠两边。",
     "condition": {
       "usage_mode": "qq"
-    }
+    },
+    "invisible": true
   },
   "read_scope_sessions_text": {
     "type": "text",
