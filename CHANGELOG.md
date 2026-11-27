@@ -2,6 +2,18 @@
 
 本文件记录「LivingMemory 桌宠直连桥接 (astrbot_plugin_coopanion_livingmemory)」插件的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.5.1] - 2026-11-27
+
+本版本可独立升级；与下列版本联调验证完成：
+
+- Coopanion 侧扩展 `cortico-world-astrbot-livingmemory` `0.2.7`
+- 上游记忆插件 `astrbot_plugin_livingmemory` `2.15.0`
+
+### 修复
+
+- **写入防火墙**：写入前剥离正文里夹带的召回记忆块、群聊上下文字段与回复提示后缀，避免记忆被反复写回、越滚越多。
+- **短窗口去重**：同一段对话在 60 秒内重复投递时只入库一次。
+
 ## [2.5.0] - 2026-11-25
 
 配套版本：

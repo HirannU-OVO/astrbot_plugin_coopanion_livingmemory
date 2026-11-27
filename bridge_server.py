@@ -62,7 +62,7 @@ KNOWN_PLATFORM_NAMES = frozenset(
 )
 
 
-VERSION = "2.5.0"
+VERSION = "2.5.1"
 # ---- 多段检索（/api/memory/search 的可选 queries） ----
 # 仅在调用方显式传 queries 时启用；不传时走的仍是原来的单段路径，行为一字不变。
 _SEGMENT_SPLIT_RE = re.compile(r"[，。；！？,;!?\r\n]+")
@@ -180,6 +180,8 @@ class LivingMemoryBridgeServer:
         self._persona_filtering_logged = False
         # 多段检索结果缓存：key -> (monotonic_ts, payload)
         self._segment_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        # 写入防火墙：60s 短窗去重缓存 (storage_session_id, role, content) -> monotonic_ts
+        self._recent_chat_writes: dict[tuple[str, str, str], float] = {}
         # 关键词子串路开关（默认开；关掉后行为与加此路之前完全一致）
         self.keyword_boost_enabled = bool(config.get("recall_keyword_boost", True))
         # 参与者显示名/别名：优先级 user_map > 旧文本 > 内部 dict 配置。
@@ -3025,6 +3027,41 @@ class LivingMemoryBridgeServer:
         )
         return web.json_response(result, status=200 if result.get("ok") else 503)
 
+    _INJECTED_MEMORY_BLOCK_RE = re.compile(r"\n*\s*【(?:相关记忆|长期记忆)】[\s\S]*$")
+    _QQ_HEADER_PREFIX_RE = re.compile(r"^【QQ[^】]*】\s*")
+    _WORLD_REPLY_HINT_RE = re.compile(r"\n?[（(](?:回(?:这条)?用|主动搭话[：:])[^\n]*$")
+    _MEMORY_BULLET_LINE_RE = re.compile(r"^-\s*\[20\d{2}-\d{2}-\d{2}\b")
+
+    @classmethod
+    def _sanitize_chat_content(cls, raw: str) -> str:
+        """剥离注入记忆块与平台包装头；纯记忆条目返回空串拒写。"""
+        text = str(raw or "").strip()
+        if not text:
+            return ""
+        text = cls._INJECTED_MEMORY_BLOCK_RE.sub("", text)
+        text = cls._WORLD_REPLY_HINT_RE.sub("", text)
+        text = cls._QQ_HEADER_PREFIX_RE.sub("", text).strip()
+        if not text or cls._MEMORY_BULLET_LINE_RE.match(text):
+            return ""
+        return text
+
+    def _is_duplicate_chat_write(
+        self, session_id: str, role: str, content: str, window_sec: float = 60.0
+    ) -> bool:
+        """60 秒短窗去重，兜底防止双通道重复写入同一条对话。"""
+        now = time.monotonic()
+        if len(self._recent_chat_writes) > 500:
+            cutoff = now - window_sec
+            self._recent_chat_writes = {
+                k: ts for k, ts in self._recent_chat_writes.items() if ts >= cutoff
+            }
+        key = (session_id, role, content)
+        prev = self._recent_chat_writes.get(key)
+        if prev is not None and (now - prev) < window_sec:
+            return True
+        self._recent_chat_writes[key] = now
+        return False
+
     async def handle_chat(self, request: web.Request) -> web.Response:
         """POST /api/memory/chat - 接收桌宠端对话流注入会话窗口"""
         await self._ensure_auto()
@@ -3085,8 +3122,11 @@ class LivingMemoryBridgeServer:
 
         for turn in turns:
             role = turn.get("role")
-            content = str(turn.get("content") or "").strip()
+            raw_content = str(turn.get("content") or "").strip()
+            content = self._sanitize_chat_content(raw_content)
             if role not in ("user", "assistant") or not content:
+                if raw_content and not content:
+                    logger.debug("[LivingMemoryBridge] 写入防火墙拦截疑似注入记忆回流内容")
                 continue
 
             ts = turn.get("timestamp") or time.time()
@@ -3110,6 +3150,11 @@ class LivingMemoryBridgeServer:
                 else str(turn.get("persona_id") or "").strip() or default_persona_id
             )
             storage_session_id = self._chat_storage_session(session_id, memory_mode)
+            if self._is_duplicate_chat_write(storage_session_id, role, content):
+                logger.debug(
+                    f"[LivingMemoryBridge] 60s 内重复对话写入已跳过 (session={storage_session_id}, role={role})"
+                )
+                continue
             platform = self._session_platform(
                 session_id, turn.get("platform") or default_platform
             )
